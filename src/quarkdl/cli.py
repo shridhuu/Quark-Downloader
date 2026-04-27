@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+from .api import QuarkApi, QuarkApiError, ShareEntry
+from .browser import BrowserLoginError, ensure_quark_login
+from .core import DownloadItem, human_bytes, parse_share_url, sanitize_rel_path, select_items
+from .downloader import ResumableDownloader
+
+DEFAULT_PROFILE = Path.home() / ".quarkdl" / "browser-profile"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="quarkdl",
+        description=(
+            "Download authorized Quark Cloud Drive shares with QR login "
+            "and resumable ranges."
+        ),
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        default=DEFAULT_PROFILE,
+        help="Playwright browser profile directory",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run browser headless (not useful for first QR login)",
+    )
+    parser.add_argument(
+        "--login-timeout", type=int, default=180, help="Seconds to wait for QR login"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = sub.add_parser("list", help="List a share")
+    list_parser.add_argument("url", help="https://pan.quark.cn/s/... share link")
+
+    download = sub.add_parser("download", help="Download a share")
+    download.add_argument("url", help="https://pan.quark.cn/s/... share link")
+    download.add_argument(
+        "-o", "--output", type=Path, default=Path("downloads"), help="Output directory"
+    )
+    download.add_argument(
+        "--yes", action="store_true", help="Do not prompt; download all selected files"
+    )
+    download.add_argument(
+        "--pick",
+        action="store_true",
+        help="Interactively choose individual files instead of root entries",
+    )
+    download.add_argument(
+        "--include", action="append", default=[], help="Include glob, repeatable (e.g. '**/*.zip')"
+    )
+    download.add_argument("--exclude", action="append", default=[], help="Exclude glob, repeatable")
+    download.add_argument(
+        "--workers", type=int, default=32, help="Concurrent range workers per file"
+    )
+    download.add_argument(
+        "--chunk-size", type=int, default=1024 * 1024, help="Range chunk size in bytes"
+    )
+    download.add_argument(
+        "--keep-cloud", action="store_true", help="Keep temporary folder in your Quark drive"
+    )
+    download.add_argument("--temp-folder", default="", help="Temporary cloud folder name")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        cookies = ensure_quark_login(
+            args.profile_dir,
+            headless=args.headless,
+            timeout_seconds=args.login_timeout,
+        )
+        api = QuarkApi.from_playwright_cookies(cookies)
+        if args.command == "list":
+            return command_list(api, args.url)
+        if args.command == "download":
+            return command_download(api, args)
+        return 2
+    except (BrowserLoginError, QuarkApiError, KeyboardInterrupt, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def command_list(api: QuarkApi, url: str) -> int:
+    link = parse_share_url(url)
+    stoken = api.get_stoken(link.pwd_id, link.passcode)
+    entries = api.walk_share(link.pwd_id, stoken)
+    files = [entry for entry in entries if not entry.is_dir]
+    folders = [entry for entry in entries if entry.is_dir]
+    total_size = human_bytes(sum(file.size for file in files))
+    print(
+        f"Share {link.pwd_id}: {len(folders)} folders, "
+        f"{len(files)} files, {total_size}"
+    )
+    for entry in entries:
+        marker = "DIR " if entry.is_dir else "FILE"
+        size = "-" if entry.is_dir else human_bytes(entry.size)
+        print(f"{marker:4} {size:>10}  {entry.path}")
+    return 0
+
+
+def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
+    link = parse_share_url(args.url)
+    stoken = api.get_stoken(link.pwd_id, link.passcode)
+    root_entries = api.list_share_folder(link.pwd_id, stoken)
+    all_entries = api.walk_share(link.pwd_id, stoken)
+    all_files = [entry for entry in all_entries if not entry.is_dir]
+    print(
+        f"Share {link.pwd_id}: {len([e for e in all_entries if e.is_dir])} folders, "
+        f"{len(all_files)} files, {human_bytes(sum(e.size for e in all_files))}"
+    )
+
+    selected_file_paths: set[str] | None = None
+    if args.yes:
+        selected_roots = root_entries
+    elif args.pick:
+        selected_file_paths = _prompt_file_selection(all_files)
+        selected_roots = roots_covering_file_paths(root_entries, selected_file_paths)
+    else:
+        selected_roots = _prompt_root_selection(root_entries)
+    if not selected_roots:
+        print("Nothing selected.")
+        return 0
+
+    temp_name = args.temp_folder or f"quarkdl-{link.pwd_id}-{time.strftime('%Y%m%d-%H%M%S')}"
+    temp_fid = api.create_folder(temp_name)
+    print(f"Temporary cloud folder created: {temp_name}")
+    try:
+        task_id = api.save_share_entries(link.pwd_id, stoken, selected_roots, temp_fid)
+        print("Saving share into your Quark drive...")
+        api.poll_task(task_id, "save share")
+        print("Save completed; listing saved files...")
+        drive_items = api.walk_drive_folder(temp_fid, temp_name)
+        files = [item for item in drive_items if not item.is_dir]
+        if selected_file_paths is not None:
+            files = [
+                item
+                for item in files
+                if sanitize_rel_path(item.path, temp_name).as_posix() in selected_file_paths
+            ]
+        files = select_items(files, include=args.include or None, exclude=args.exclude or None)
+        if not files:
+            print("No files matched the selection.")
+            return 0
+        total_size = sum(item.size for item in files)
+        print(f"Downloading {len(files)} files ({human_bytes(total_size)}) to {args.output}")
+        if not args.yes and not _confirm("Proceed with download?", default=True):
+            return 0
+        downloader = ResumableDownloader(
+            api,
+            args.output,
+            temp_parent=temp_name,
+            chunk_size=args.chunk_size,
+            workers=args.workers,
+        )
+        downloader.download_many(files, progress=_progress)
+        _verify_output(args.output, temp_name, files)
+        print("All files downloaded and byte-size verified.")
+        return 0
+    finally:
+        if args.keep_cloud:
+            print(f"Temporary cloud folder kept: {temp_name}")
+        else:
+            print("Deleting temporary cloud folder...")
+            try:
+                api.delete_file(temp_fid)
+                print("Temporary cloud folder deleted.")
+            except Exception as exc:  # pragma: no cover - network cleanup best-effort
+                print(f"Warning: cloud cleanup failed; delete manually: {temp_name}. Detail: {exc}")
+
+
+def _prompt_root_selection(entries: list[ShareEntry]) -> list[ShareEntry]:
+    print("Root entries:")
+    for idx, entry in enumerate(entries, 1):
+        kind = "folder" if entry.is_dir else "file"
+        size = "-" if entry.is_dir else human_bytes(entry.size)
+        print(f"  {idx:>2}. {kind:6} {size:>10}  {entry.file_name}")
+    raw = input("Select entries (all, or comma-separated numbers) [all]: ").strip()
+    if not raw or raw.lower() in {"a", "all"}:
+        return entries
+    indexes: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        indexes.add(int(part))
+    return [entry for idx, entry in enumerate(entries, 1) if idx in indexes]
+
+
+def _prompt_file_selection(entries: list[ShareEntry]) -> set[str]:
+    files = [entry for entry in entries if not entry.is_dir]
+    print("Files:")
+    for idx, entry in enumerate(files, 1):
+        print(f"  {idx:>3}. {human_bytes(entry.size):>10}  {entry.path}")
+    raw = input("Select files (all, or comma-separated numbers) [all]: ").strip()
+    if not raw or raw.lower() in {"a", "all"}:
+        return {entry.path for entry in files}
+    indexes: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        indexes.add(int(part))
+    return {entry.path for idx, entry in enumerate(files, 1) if idx in indexes}
+
+
+def roots_covering_file_paths(
+    root_entries: list[ShareEntry], selected_file_paths: set[str]
+) -> list[ShareEntry]:
+    selected: list[ShareEntry] = []
+    for entry in root_entries:
+        if entry.is_dir:
+            prefix = entry.path.rstrip("/") + "/"
+            if any(path.startswith(prefix) for path in selected_file_paths):
+                selected.append(entry)
+        elif entry.path in selected_file_paths:
+            selected.append(entry)
+    return selected
+
+
+def _confirm(question: str, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    raw = input(f"{question} {suffix} ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def _progress(item: DownloadItem, done: int, total: int) -> None:
+    pct = 100 * done / total if total else 100
+    print(f"  {pct:5.1f}% {human_bytes(done)}/{human_bytes(total)} {item.path}")
+
+
+def _verify_output(output: Path, temp_parent: str, items: list[DownloadItem]) -> None:
+    missing = []
+    mismatched = []
+    for item in items:
+        rel = sanitize_rel_path(item.path, temp_parent)
+        path = output / rel
+        if not path.exists():
+            missing.append(rel.as_posix())
+        elif path.stat().st_size != item.size:
+            mismatched.append((rel.as_posix(), item.size, path.stat().st_size))
+    if missing or mismatched:
+        raise RuntimeError(
+            f"verification failed: missing={len(missing)} mismatched={len(mismatched)}"
+        )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
