@@ -75,7 +75,28 @@ git clone https://github.com/shridhuu/Quark-Downloader.git
 cd Quark-Downloader
 ```
 
-### 3. Create a virtual environment and install
+### 3. Install & Run
+
+#### Option A: Direct Run (No Virtual Environment Needed)
+
+You can run directly using your global Python installation:
+
+```bash
+# 1. Install dependencies & chromium once (if not already installed)
+pip install -e .
+python -m playwright install chromium
+
+# 2. Run anywhere!
+quarkdl list "https://pan.quark.cn/s/your-share-id"
+quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads
+
+# Or run directly with python inside the folder (no pip install needed):
+python main.py download "https://pan.quark.cn/s/your-share-id" -o downloads
+```
+
+#### Option B: Isolated Virtual Environment (Optional)
+
+If you prefer keeping dependencies inside an isolated folder:
 
 **Windows (PowerShell)**
 

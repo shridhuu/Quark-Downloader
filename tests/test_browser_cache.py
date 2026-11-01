@@ -43,3 +43,4 @@ def test_ensure_quark_login_returns_cached(tmp_path: Path):
     with patch("quarkdl.browser._validate_cached_cookies", return_value=True):
         result = ensure_quark_login(tmp_path)
         assert result == cookies
+
