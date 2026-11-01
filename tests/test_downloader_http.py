@@ -246,3 +246,64 @@ def test_download_many_continues_after_a_failed_file(server, tmp_path):
 
     assert [(i.fid, "nope" in msg) for i, msg in failures] == [("bad.bin", True)]
     assert (tmp_path / "out" / "root" / "good.bin").read_bytes() == PAYLOAD[:50_000]
+
+
+def test_ranged_download_resumes_from_meta_manifest(server, tmp_path):
+    server.state["files"]["/big.bin"] = PAYLOAD
+    chunk_size = 256 * 1024
+    _, downloader = _make(server, tmp_path, chunk_size=chunk_size, workers=2)
+    part = tmp_path / "out" / "root" / "big.bin.part"
+    meta = tmp_path / "out" / "root" / "big.bin.meta"
+    part.parent.mkdir(parents=True)
+
+    # Pre-populate part file with expected size and first two chunks
+    with part.open("wb") as fh:
+        fh.seek(len(PAYLOAD) - 1)
+        fh.write(b"\0")
+        fh.seek(0)
+        fh.write(PAYLOAD[: 2 * chunk_size])
+
+    import json
+
+    meta.write_text(
+        json.dumps({"expected": len(PAYLOAD), "chunk_size": chunk_size, "completed": [0, 1]}),
+        encoding="utf-8",
+    )
+
+    with downloader:
+        dest = downloader.download_one(_item())
+
+    assert dest.read_bytes() == PAYLOAD
+    assert not meta.exists()
+    assert server.state["requests"] == len(PAYLOAD) // chunk_size - 2
+
+
+def test_download_many_parallel_files(server, tmp_path):
+    f1 = PAYLOAD[:100_000]
+    f2 = PAYLOAD[100_000:250_000]
+    f3 = PAYLOAD[250_000:450_000]
+    server.state["files"]["/f1.bin"] = f1
+    server.state["files"]["/f2.bin"] = f2
+    server.state["files"]["/f3.bin"] = f3
+
+    _, downloader = _make(server, tmp_path, parallel_files=3)
+    items = [_item("f1.bin", len(f1)), _item("f2.bin", len(f2)), _item("f3.bin", len(f3))]
+
+    with downloader:
+        failures = downloader.download_many(items)
+
+    assert failures == []
+    assert (tmp_path / "out" / "root" / "f1.bin").read_bytes() == f1
+    assert (tmp_path / "out" / "root" / "f2.bin").read_bytes() == f2
+    assert (tmp_path / "out" / "root" / "f3.bin").read_bytes() == f3
+
+
+def test_download_with_rate_limiter(server, tmp_path):
+    data = PAYLOAD[:50_000]
+    server.state["files"]["/limited.bin"] = data
+    _, downloader = _make(server, tmp_path, rate_limit=500_000)
+
+    with downloader:
+        dest = downloader.download_one(_item("limited.bin", len(data)))
+
+    assert dest.read_bytes() == data

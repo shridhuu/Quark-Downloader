@@ -64,3 +64,19 @@ def test_roots_covering_file_paths_selects_minimum_root_entries():
     selected = roots_covering_file_paths(roots, {"Folder/a.zip", "loose.txt"})
 
     assert [entry.fid for entry in selected] == ["folder", "loose"]
+
+
+def test_download_command_accepts_parallel_files_and_limit_rate():
+    args = build_parser().parse_args(
+        [
+            "download",
+            "https://pan.quark.cn/s/abc123",
+            "--parallel-files",
+            "4",
+            "--limit-rate",
+            "5M",
+        ]
+    )
+
+    assert args.parallel_files == 4
+    assert args.limit_rate == "5M"

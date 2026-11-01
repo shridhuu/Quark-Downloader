@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -7,9 +8,37 @@ from typing import Any
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from .api import WEB_UA
+
 
 class BrowserLoginError(RuntimeError):
     pass
+
+
+def _validate_cached_cookies(cookies: list[dict[str, Any]]) -> bool:
+    try:
+        import requests
+
+        session = requests.Session()
+        for cookie in cookies:
+            name = cookie.get("name")
+            val = cookie.get("value", "")
+            domain = cookie.get("domain")
+            if name and domain:
+                session.cookies.set(name, val, domain=domain, path=cookie.get("path") or "/")
+        resp = session.get(
+            "https://pan.quark.cn/account/info",
+            params={"fr": "pc", "platform": "pc"},
+            headers={"User-Agent": WEB_UA, "Origin": "https://pan.quark.cn"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if (data.get("data") or {}).get("nickname"):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def ensure_quark_login(
@@ -18,13 +47,24 @@ def ensure_quark_login(
     headless: bool = False,
     timeout_seconds: int = 180,
     keep_open: bool = False,
+    force_refresh: bool = False,
 ) -> list[dict[str, Any]]:
     """Open a persistent browser profile and return authenticated cookies.
 
+    Checks cached cookies first via account_info to avoid launching browser when valid.
     The browser is deliberately official-site-first: users scan Quark's own QR code in the
     opened page. No password, SMS code, cookie, token, or generated URL is requested.
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
+    cookie_cache_path = profile_dir / "cookies.json"
+    if not force_refresh and cookie_cache_path.exists():
+        try:
+            cached = json.loads(cookie_cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, list) and _validate_cached_cookies(cached):
+                return cached
+        except Exception:
+            pass
+
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
@@ -39,7 +79,14 @@ def ensure_quark_login(
             announced = False
             while time.time() < deadline:
                 if _logged_in(page):
-                    return context.cookies()
+                    cookies = context.cookies()
+                    try:
+                        cookie_cache_path.write_text(
+                            json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+                    return cookies
                 if not announced:
                     print(
                         "If a Quark login QR is visible in the browser, "

@@ -30,13 +30,35 @@ class DownloadError(RuntimeError):
     pass
 
 
-class _SessionPool:
-    """Reusable keep-alive sessions for CDN range requests.
+class RateLimiter:
+    """Token-bucket bandwidth limiter shared across all active transfers."""
 
-    Every chunk used to build a brand-new ``requests.Session``, paying a TCP + TLS handshake per
-    chunk. Sessions are now created lazily, handed to one worker at a time and returned to the
-    pool, so their connections stay open across chunks and files.
-    """
+    def __init__(self, bytes_per_sec: int | None = None) -> None:
+        self.rate = bytes_per_sec
+        self._capacity = float(bytes_per_sec) if bytes_per_sec else 0.0
+        self._tokens = self._capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self, nbytes: int) -> None:
+        if not self.rate or nbytes <= 0:
+            return
+        with self._lock:
+            while True:
+                now = time.monotonic()
+                elapsed = now - self._last
+                self._last = now
+                self._tokens = min(self._capacity, self._tokens + elapsed * self.rate)
+                if self._tokens >= nbytes:
+                    self._tokens -= nbytes
+                    return
+                needed = nbytes - self._tokens
+                sleep_time = min(needed / self.rate, 0.1)
+                time.sleep(sleep_time)
+
+
+class _SessionPool:
+    """Reusable keep-alive sessions for CDN range requests."""
 
     def __init__(self, source: requests.Session) -> None:
         self._source = source
@@ -106,21 +128,27 @@ class ResumableDownloader:
         temp_parent: str | None = None,
         chunk_size: int = 1024 * 1024,
         workers: int = 32,
+        parallel_files: int = 1,
         range_threshold: int = 2 * 1024 * 1024,
         retries: int = DEFAULT_RETRIES,
+        rate_limit: int | None = None,
         status_path: Path | None = None,
     ) -> None:
         self.api = api
         self.output_dir = output_dir
         self.temp_parent = temp_parent
         self.chunk_size = chunk_size
-        self.workers = workers
+        self.workers = max(1, workers)
+        self.parallel_files = max(1, parallel_files)
         self.range_threshold = range_threshold
         self.retries = max(1, retries)
+        self.rate_limiter = RateLimiter(rate_limit) if rate_limit else None
         self.status_path = status_path or output_dir / ".quarkdl-status.json"
         self.status = self._load_status()
         self._pool: _SessionPool | None = None
         self._last_status_save = 0.0
+        self._conn_semaphore = threading.BoundedSemaphore(self.workers)
+        self._status_lock = threading.Lock()
 
     def close(self) -> None:
         if self._pool is not None:
@@ -147,12 +175,13 @@ class ResumableDownloader:
         return {"items": {}, "updated_at": None}
 
     def _save_status(self) -> None:
-        self.status["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        self.status_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.status_path.with_suffix(self.status_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(self.status, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.status_path)
-        self._last_status_save = time.monotonic()
+        with self._status_lock:
+            self.status["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            self.status_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.status_path.with_suffix(self.status_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self.status, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.status_path)
+            self._last_status_save = time.monotonic()
 
     def _save_status_throttled(self) -> None:
         if time.monotonic() - self._last_status_save >= STATUS_SAVE_INTERVAL:
@@ -161,21 +190,36 @@ class ResumableDownloader:
     def download_many(
         self, items: list[DownloadItem], progress: ProgressCallback | None = None
     ) -> list[tuple[DownloadItem, str]]:
-        """Download every item; a failing file no longer aborts the rest.
-
-        Returns the ``(item, error message)`` pairs that failed.
-        """
+        """Download every item. If parallel_files > 1, downloads files concurrently."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         total = len(items)
         failures: list[tuple[DownloadItem, str]] = []
-        for index, item in enumerate(items, 1):
+        failures_lock = threading.Lock()
+
+        def _download_task(index: int, item: DownloadItem) -> None:
             print(f"[{index}/{total}] {item.path} ({item.size} bytes)")
             try:
                 self.download_one(item, progress=progress)
             except (DownloadError, QuarkApiError, requests.RequestException, ValueError) as exc:
-                print(f"  FAILED: {exc}", file=sys.stderr)
-                failures.append((item, str(exc)))
+                print(f"  FAILED: {item.path}: {exc}", file=sys.stderr)
+                with failures_lock:
+                    failures.append((item, str(exc)))
                 self._save_status()
+
+        if self.parallel_files <= 1 or total <= 1:
+            for index, item in enumerate(items, 1):
+                _download_task(index, item)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(self.parallel_files, total)
+            ) as executor:
+                futures = [
+                    executor.submit(_download_task, index, item)
+                    for index, item in enumerate(items, 1)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+
         return failures
 
     def download_one(self, item: DownloadItem, progress: ProgressCallback | None = None) -> Path:
@@ -186,14 +230,16 @@ class ResumableDownloader:
         expected = int(item.size)
         dest = self.output_dir / rel_path
         part = dest.with_name(dest.name + ".part")
-        chunks_dir = dest.with_name(dest.name + ".chunks")
+        meta = dest.with_name(dest.name + ".meta")
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        record = self.status["items"].setdefault(
-            rel_key, {"fid": item.fid, "expected_size": expected, "status": "pending"}
-        )
+        with self._status_lock:
+            record = self.status["items"].setdefault(
+                rel_key, {"fid": item.fid, "expected_size": expected, "status": "pending"}
+            )
         if dest.exists() and dest.stat().st_size == expected:
-            record.update({"status": "completed", "bytes": expected})
+            with self._status_lock:
+                record.update({"status": "completed", "bytes": expected})
             self._save_status()
             if progress:
                 progress(item, expected, expected)
@@ -202,9 +248,9 @@ class ResumableDownloader:
             dest.rename(dest.with_name(dest.name + f".size_mismatch_{dest.stat().st_size}"))
 
         if expected == 0:
-            # Nothing to fetch; avoids a pointless URL request and an empty-file edge case.
             dest.write_bytes(b"")
-            record.update({"status": "completed", "bytes": 0})
+            with self._status_lock:
+                record.update({"status": "completed", "bytes": 0})
             self._save_status()
             if progress:
                 progress(item, 0, 0)
@@ -213,7 +259,7 @@ class ResumableDownloader:
         info = self.api.get_download_info(item.fid)
         urls = _UrlProvider(self.api, item.fid, info["download_url"])
         if expected >= self.range_threshold:
-            self._download_ranged(urls, item, dest, part, chunks_dir, record, progress)
+            self._download_ranged(urls, item, dest, part, meta, record, progress)
         else:
             self._download_stream(urls, item, dest, part, record, progress)
         return dest
@@ -248,34 +294,38 @@ class ResumableDownloader:
                 headers["Range"] = f"bytes={existing}-"
             retry_after: float | None = None
             try:
-                with self.api.session.get(
-                    url, headers=headers, stream=True, timeout=(30, 180)
-                ) as response:
-                    code = response.status_code
-                    if code in AUTH_EXPIRED_CODES:
-                        last_error = f"HTTP {code} (download link expired?)"
-                        url = urls.refresh(url)
-                    elif code not in (200, 206):
-                        last_error = f"HTTP {code}"
-                        retry_after = _retry_after(response)
-                    else:
-                        if existing and code == 200:  # server ignored Range; restart the file
-                            existing = 0
-                        written = existing
-                        with part.open("ab" if existing else "wb") as fh:
-                            for block in response.iter_content(chunk_size=1024 * 1024):
-                                if not block:
-                                    continue
-                                fh.write(block)
-                                written += len(block)
-                                record.update({"status": "downloading", "bytes": written})
-                                if progress:
-                                    progress(item, written, expected)
-                                self._save_status_throttled()
-                        if part.stat().st_size == expected:
-                            complete = True
-                            break
-                        last_error = f"size {part.stat().st_size}, expected {expected}"
+                with self._conn_semaphore:
+                    with self.api.session.get(
+                        url, headers=headers, stream=True, timeout=(30, 180)
+                    ) as response:
+                        code = response.status_code
+                        if code in AUTH_EXPIRED_CODES:
+                            last_error = f"HTTP {code} (download link expired?)"
+                            url = urls.refresh(url)
+                        elif code not in (200, 206):
+                            last_error = f"HTTP {code}"
+                            retry_after = _retry_after(response)
+                        else:
+                            if existing and code == 200:
+                                existing = 0
+                            written = existing
+                            with part.open("ab" if existing else "wb") as fh:
+                                for block in response.iter_content(chunk_size=256 * 1024):
+                                    if not block:
+                                        continue
+                                    if self.rate_limiter:
+                                        self.rate_limiter.consume(len(block))
+                                    fh.write(block)
+                                    written += len(block)
+                                    with self._status_lock:
+                                        record.update({"status": "downloading", "bytes": written})
+                                    if progress:
+                                        progress(item, written, expected)
+                                    self._save_status_throttled()
+                            if part.stat().st_size == expected:
+                                complete = True
+                                break
+                            last_error = f"size {part.stat().st_size}, expected {expected}"
             except (requests.RequestException, QuarkApiError) as exc:
                 last_error = str(exc)
             if attempt < self.retries:
@@ -285,7 +335,8 @@ class ResumableDownloader:
             self._save_status()
             raise DownloadError(f"download failed for {item.path}: {last_error}")
         part.replace(dest)
-        record.update({"status": "completed", "bytes": expected})
+        with self._status_lock:
+            record.update({"status": "completed", "bytes": expected})
         self._save_status()
 
     def _download_ranged(
@@ -294,84 +345,174 @@ class ResumableDownloader:
         item: DownloadItem,
         dest: Path,
         part: Path,
-        chunks_dir: Path,
+        meta: Path,
         record: dict,
         progress: ProgressCallback | None,
     ) -> None:
+        """Download range chunks directly into the .part file (zero assembly)."""
         expected = int(item.size)
-        if part.exists():
-            part.unlink()
-        chunks_dir.mkdir(parents=True, exist_ok=True)
         ranges = plan_ranges(expected, self.chunk_size)
-        pending = []
+        completed_indices: set[int] = set()
+
+        # Check existing manifest
+        if part.exists() and part.stat().st_size == expected and meta.exists():
+            try:
+                meta_data = json.loads(meta.read_text(encoding="utf-8"))
+                if (
+                    meta_data.get("expected") == expected
+                    and meta_data.get("chunk_size") == self.chunk_size
+                ):
+                    completed_indices = set(meta_data.get("completed", []))
+            except Exception:
+                pass
+
+        # Backward compatibility with older *.chunks directory
+        chunks_dir = dest.with_name(dest.name + ".chunks")
+        if chunks_dir.exists() and not completed_indices:
+            completed_indices = _migrate_legacy_chunks(chunks_dir, part, expected, ranges)
+
+        # Preallocate/truncate .part file to expected size if needed
+        if not part.exists() or part.stat().st_size != expected or not completed_indices:
+            completed_indices = set()
+            with part.open("wb") as fh:
+                if expected > 0:
+                    fh.seek(expected - 1)
+                    fh.write(b"\0")
+            _save_meta(meta, expected, self.chunk_size, completed_indices)
+
         done_bytes = 0
+        pending = []
         for idx, (start, end) in enumerate(ranges):
-            chunk_path = chunks_dir / f"{idx:06d}.part"
             chunk_len = end - start + 1
-            if chunk_path.exists() and chunk_path.stat().st_size == chunk_len:
+            if idx in completed_indices:
                 done_bytes += chunk_len
             else:
-                pending.append((idx, start, end, chunk_path))
-        record.update(
-            {
-                "status": "downloading",
-                "bytes": done_bytes,
-                "chunks_done": len(ranges) - len(pending),
-                "chunks_total": len(ranges),
-            }
-        )
+                pending.append((idx, start, end))
+
+        with self._status_lock:
+            record.update(
+                {
+                    "status": "downloading",
+                    "bytes": done_bytes,
+                    "chunks_done": len(completed_indices),
+                    "chunks_total": len(ranges),
+                }
+            )
         self._save_status()
         if progress:
             progress(item, done_bytes, expected)
 
+        if not pending:
+            part.replace(dest)
+            meta.unlink(missing_ok=True)
+            with self._status_lock:
+                record.update(
+                    {"status": "completed", "bytes": expected, "chunks_done": len(ranges)}
+                )
+            self._save_status()
+            return
+
         pool = self._session_pool()
+        file_write_lock = threading.Lock()
+        meta_save_lock = threading.Lock()
+        last_meta_save = [time.monotonic()]
+
+        def _save_meta_throttled() -> None:
+            now = time.monotonic()
+            if now - last_meta_save[0] >= 2.0:
+                with meta_save_lock:
+                    _save_meta(meta, expected, self.chunk_size, completed_indices)
+                    last_meta_save[0] = time.monotonic()
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(self.workers, max(1, len(pending)))
         ) as executor:
             futures = {
                 executor.submit(
-                    _download_chunk,
+                    _download_chunk_inplace,
                     pool,
                     urls,
                     start,
                     end,
-                    chunk_path,
+                    part,
+                    file_write_lock,
                     item.path,
+                    self._conn_semaphore,
+                    self.rate_limiter,
                     self.retries,
                 ): (idx, start, end)
-                for idx, start, end, chunk_path in pending
+                for idx, start, end in pending
             }
-            completed = len(ranges) - len(pending)
             try:
                 for future in concurrent.futures.as_completed(futures):
-                    done_bytes += future.result()
-                    completed += 1
-                    record.update(
-                        {
-                            "status": "downloading",
-                            "bytes": done_bytes,
-                            "chunks_done": completed,
-                            "chunks_total": len(ranges),
-                        }
-                    )
+                    idx, start, end = futures[future]
+                    got = future.result()
+                    done_bytes += got
+                    completed_indices.add(idx)
+                    with self._status_lock:
+                        record.update(
+                            {
+                                "status": "downloading",
+                                "bytes": done_bytes,
+                                "chunks_done": len(completed_indices),
+                                "chunks_total": len(ranges),
+                            }
+                        )
                     if progress:
                         progress(item, done_bytes, expected)
                     self._save_status_throttled()
+                    _save_meta_throttled()
             except BaseException:
-                # Don't make the user wait for the rest of the file once one chunk is hopeless.
                 for future in futures:
                     future.cancel()
+                with meta_save_lock:
+                    _save_meta(meta, expected, self.chunk_size, completed_indices)
                 self._save_status()
                 raise
-        _assemble(chunks_dir, part, ranges)
-        if part.stat().st_size != expected:
+
+        if part.stat().st_size != expected or len(completed_indices) != len(ranges):
             raise DownloadError(
                 f"size mismatch for {item.path}: got {part.stat().st_size}, expected {expected}"
             )
         part.replace(dest)
-        shutil.rmtree(chunks_dir, ignore_errors=True)
-        record.update({"status": "completed", "bytes": expected, "chunks_done": len(ranges)})
+        meta.unlink(missing_ok=True)
+        with self._status_lock:
+            record.update({"status": "completed", "bytes": expected, "chunks_done": len(ranges)})
         self._save_status()
+
+
+def _save_meta(meta_path: Path, expected: int, chunk_size: int, completed: set[int]) -> None:
+    try:
+        tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+        payload = {
+            "expected": expected,
+            "chunk_size": chunk_size,
+            "completed": sorted(completed),
+        }
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(meta_path)
+    except Exception:
+        pass
+
+
+def _migrate_legacy_chunks(
+    chunks_dir: Path, part: Path, expected: int, ranges: list[tuple[int, int]]
+) -> set[int]:
+    """Import existing legacy *.chunks files into the single .part file."""
+    completed: set[int] = set()
+    with part.open("wb") as out:
+        if expected > 0:
+            out.seek(expected - 1)
+            out.write(b"\0")
+        for idx, (start, end) in enumerate(ranges):
+            chunk_file = chunks_dir / f"{idx:06d}.part"
+            chunk_len = end - start + 1
+            if chunk_file.exists() and chunk_file.stat().st_size == chunk_len:
+                out.seek(start)
+                out.write(chunk_file.read_bytes())
+                completed.add(idx)
+    shutil.rmtree(chunks_dir, ignore_errors=True)
+    return completed
 
 
 def _cdn_headers() -> dict[str, str]:
@@ -383,7 +524,6 @@ def _cdn_headers() -> dict[str, str]:
 
 
 def _retry_after(response: requests.Response) -> float | None:
-    """Parse a numeric ``Retry-After`` header (seconds), capped to something sane."""
     value = response.headers.get("Retry-After")
     if not value:
         return None
@@ -394,11 +534,80 @@ def _retry_after(response: requests.Response) -> float | None:
 
 
 def _sleep_backoff(attempt: int, retry_after: float | None = None) -> None:
-    """Sleep with exponential backoff and jitter, or as long as the server asked."""
     if retry_after is not None:
         time.sleep(retry_after)
         return
     time.sleep(min(2**attempt, 12) * (0.5 + random.random() / 2))
+
+
+def _download_chunk_inplace(
+    pool: _SessionPool,
+    urls: _UrlProvider,
+    start: int,
+    end: int,
+    part_path: Path,
+    write_lock: threading.Lock,
+    display_path: str,
+    conn_semaphore: threading.BoundedSemaphore,
+    rate_limiter: RateLimiter | None = None,
+    retries: int = DEFAULT_RETRIES,
+) -> int:
+    """Download a chunk into memory and write directly to part_path at offset `start`."""
+    expected = end - start + 1
+    headers = _cdn_headers()
+    headers["Range"] = f"bytes={start}-{end}"
+    url = urls.current()
+    last_error = "unknown"
+
+    for attempt in range(1, retries + 1):
+        retry_after: float | None = None
+        try:
+            with conn_semaphore:
+                with pool.acquire() as session:
+                    with session.get(
+                        url, headers=headers, stream=True, timeout=(25, 180)
+                    ) as response:
+                        code = response.status_code
+                        if code == 206:
+                            buffer = bytearray()
+                            for block in response.iter_content(chunk_size=256 * 1024):
+                                if not block:
+                                    continue
+                                if rate_limiter:
+                                    rate_limiter.consume(len(block))
+                                buffer.extend(block)
+                            if len(buffer) == expected:
+                                with write_lock:
+                                    with part_path.open("r+b") as fh:
+                                        fh.seek(start)
+                                        fh.write(buffer)
+                                return expected
+                            last_error = f"chunk size {len(buffer)}, expected {expected}"
+                        elif code in AUTH_EXPIRED_CODES:
+                            last_error = f"HTTP {code} (download link expired?)"
+                            url = urls.refresh(url)
+                        else:
+                            last_error = f"HTTP {code}"
+                            retry_after = _retry_after(response)
+        except (requests.RequestException, QuarkApiError) as exc:
+            last_error = str(exc)
+        if attempt < retries:
+            _sleep_backoff(attempt, retry_after)
+    raise DownloadError(f"chunk failed for {display_path} bytes={start}-{end}: {last_error}")
+
+
+# Kept for backward compatibility with existing tests
+def _assemble(chunks_dir: Path, part: Path, ranges: list[tuple[int, int]]) -> None:
+    tmp = part.with_suffix(part.suffix + ".assembling")
+    with tmp.open("wb") as out:
+        for idx, (start, end) in enumerate(ranges):
+            chunk_path = chunks_dir / f"{idx:06d}.part"
+            expected = end - start + 1
+            if not chunk_path.exists() or chunk_path.stat().st_size != expected:
+                raise DownloadError(f"missing or invalid chunk {idx}")
+            with chunk_path.open("rb") as fh:
+                shutil.copyfileobj(fh, out, length=1024 * 1024)
+    tmp.replace(part)
 
 
 def _download_chunk(
@@ -410,6 +619,7 @@ def _download_chunk(
     display_path: str,
     retries: int = DEFAULT_RETRIES,
 ) -> int:
+    """Legacy chunk downloader writing to standalone chunk_path file."""
     expected = end - start + 1
     if chunk_path.exists() and chunk_path.stat().st_size == expected:
         return expected
@@ -449,16 +659,3 @@ def _download_chunk(
         if attempt < retries:
             _sleep_backoff(attempt, retry_after)
     raise DownloadError(f"chunk failed for {display_path} bytes={start}-{end}: {last_error}")
-
-
-def _assemble(chunks_dir: Path, part: Path, ranges: list[tuple[int, int]]) -> None:
-    tmp = part.with_suffix(part.suffix + ".assembling")
-    with tmp.open("wb") as out:
-        for idx, (start, end) in enumerate(ranges):
-            chunk_path = chunks_dir / f"{idx:06d}.part"
-            expected = end - start + 1
-            if not chunk_path.exists() or chunk_path.stat().st_size != expected:
-                raise DownloadError(f"missing or invalid chunk {idx}")
-            with chunk_path.open("rb") as fh:
-                shutil.copyfileobj(fh, out, length=1024 * 1024)
-    tmp.replace(part)

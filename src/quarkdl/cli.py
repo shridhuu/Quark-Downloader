@@ -7,7 +7,14 @@ from pathlib import Path
 
 from .api import QuarkApi, QuarkApiError, ShareEntry
 from .browser import BrowserLoginError, ensure_quark_login
-from .core import DownloadItem, human_bytes, parse_share_url, sanitize_rel_path, select_items
+from .core import (
+    DownloadItem,
+    human_bytes,
+    parse_rate_limit,
+    parse_share_url,
+    sanitize_rel_path,
+    select_items,
+)
 from .downloader import DEFAULT_RETRIES, DownloadError, ResumableDownloader
 from .progress import ProgressReporter
 
@@ -69,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers", type=_positive_int, default=32, help="Concurrent range workers per file"
     )
     download.add_argument(
+        "--parallel-files",
+        type=_positive_int,
+        default=1,
+        help="Number of files to download concurrently (default: %(default)s)",
+    )
+    download.add_argument(
         "--chunk-size", type=_positive_int, default=1024 * 1024, help="Range chunk size in bytes"
     )
     download.add_argument(
@@ -76,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=DEFAULT_RETRIES,
         help="Attempts per chunk/file before giving up (default: %(default)s)",
+    )
+    download.add_argument(
+        "--limit-rate",
+        type=str,
+        default=None,
+        help="Maximum download speed, e.g. '5M', '500K', '10MB/s' (default: unlimited)",
     )
     download.add_argument(
         "--keep-cloud", action="store_true", help="Keep temporary folder in your Quark drive"
@@ -148,8 +167,17 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
         return 0
 
     temp_name = args.temp_folder or f"quarkdl-{link.pwd_id}-{time.strftime('%Y%m%d-%H%M%S')}"
-    temp_fid = api.create_folder(temp_name)
-    print(f"Temporary cloud folder created: {temp_name}")
+    existing_folders = {item.name: item.fid for item in api.list_drive_folder("0") if item.is_dir}
+    if temp_name in existing_folders:
+        temp_fid = existing_folders[temp_name]
+        print(f"Reusing existing cloud folder: {temp_name}")
+    else:
+        temp_fid = api.create_folder(temp_name)
+        print(f"Temporary cloud folder created: {temp_name}")
+
+    failures: list[tuple[DownloadItem, str]] = [
+        (DownloadItem(fid="placeholder", path="", size=0), "interrupted")
+    ]
     try:
         task_id = api.save_share_entries(link.pwd_id, stoken, selected_roots, temp_fid)
         print("Saving share into your Quark drive...")
@@ -166,18 +194,24 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
         files = select_items(files, include=args.include or None, exclude=args.exclude or None)
         if not files:
             print("No files matched the selection.")
+            failures.clear()
             return 0
         total_size = sum(item.size for item in files)
         print(f"Downloading {len(files)} files ({human_bytes(total_size)}) to {args.output}")
         if not args.yes and not _confirm("Proceed with download?", default=True):
+            failures.clear()
             return 0
+
+        rate_limit_bps = parse_rate_limit(args.limit_rate) if args.limit_rate else None
         downloader = ResumableDownloader(
             api,
             args.output,
             temp_parent=temp_name,
             chunk_size=args.chunk_size,
             workers=args.workers,
+            parallel_files=args.parallel_files,
             retries=args.retries,
+            rate_limit=rate_limit_bps,
         )
         reporter = ProgressReporter(total_bytes=total_size)
         try:
@@ -198,8 +232,14 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
         print("All files downloaded and byte-size verified.")
         return 0
     finally:
-        if args.keep_cloud:
-            print(f"Temporary cloud folder kept: {temp_name}")
+        if args.keep_cloud or failures:
+            if failures and not args.keep_cloud:
+                print(
+                    f"Cloud folder preserved for resume: {temp_name} "
+                    f"(use --temp-folder {temp_name} on next run)"
+                )
+            else:
+                print(f"Temporary cloud folder kept: {temp_name}")
         else:
             print("Deleting temporary cloud folder...")
             try:

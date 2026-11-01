@@ -1,6 +1,6 @@
 # Quark Downloader
 
-A small, local-first command-line tool for downloading **Quark Cloud Drive** shares you are authorized to access — with fast parallel range downloads, automatic retries, resume support, and live speed / ETA.
+A small, local-first command-line tool for downloading **Quark Cloud Drive** shares you are authorized to access — with fast parallel range downloads, multi-file concurrency, bandwidth throttling, automatic retries, zero-assembly resume, and live speed / ETA.
 
 Paste a `pan.quark.cn/s/...` link, scan Quark's official QR login once, and download the whole share or just the files you want.
 
@@ -12,18 +12,23 @@ Paste a `pan.quark.cn/s/...` link, scan Quark's official QR login once, and down
 
 * **⚡ Fast Parallel Downloads:**
   * **Range Chunks:** Every large file is split into 1 MiB range chunks fetched by up to 32 connections at once.
-  * **Connection Reuse:** Keep-alive sessions are reused across chunks and files, so there is no new TCP/TLS handshake per chunk.
-* **📊 Live Progress:** Per-file and overall progress with a rolling transfer **speed** and **ETA**, plus an average-speed summary at the end.
-* **🔁 Resume Anywhere:** Interrupted downloads continue from the chunks (or `.part` file) already on disk. Finished files are skipped.
+  * **Connection Reuse:** Keep-alive sessions are pooled across chunks and files — no TCP/TLS handshake overhead per chunk.
+  * **Zero-Assembly In-Place Writing:** Chunks write directly into the preallocated file at their exact byte offsets. No thousands of separate chunk files, no assembly pass, and **no 2× disk space** requirement!
+* **🚀 Multi-File Concurrency:** Download multiple files simultaneously with `--parallel-files N` while sharing a global connection budget.
+* **🛑 Bandwidth Throttling:** Cap download speeds with `--limit-rate` (e.g. `--limit-rate 5M` or `--limit-rate 500K`).
+* **⚡ Instant Startup:** Verified login sessions are cached locally. After the first QR scan, subsequent runs execute instantly without launching Chromium.
+* **📊 Live Progress:** Per-file and overall progress with rolling transfer **speed** and **ETA**, plus an average-speed summary at the end.
+* **🔁 Resume Anywhere:** Interrupted downloads resume from a compact `.meta` manifest and in-place `.part` file. Completed files and chunks are never re-downloaded.
 * **🛡️ Self-Healing:**
-  * **Smart Retries:** Exponential backoff with jitter, and `Retry-After` is honored. Configure with `--retries`.
-  * **Expired Links:** If Quark's download link expires mid-transfer (HTTP 401/403), a fresh one is fetched automatically.
-  * **No Batch Aborts:** One failing file no longer stops the rest — failures are listed at the end.
+  * **Smart Retries:** Exponential backoff with jitter and `Retry-After` header support.
+  * **Expired Links:** If Quark's download link expires mid-transfer (HTTP 401/403), a fresh one is minted automatically.
+  * **Cloud Folder Preservation:** If a download is cancelled or interrupted, the temporary cloud folder is preserved and reused on your next run with `--temp-folder`.
+  * **No Batch Aborts:** One failing file never stops the rest — failures are listed at the end.
 * **🎯 Download Only What You Need:** Pick individual files interactively (`--pick`) or filter with glob patterns (`--include` / `--exclude`).
 * **🔐 Safe Login:** Official QR flow in a real browser window. No passwords, SMS codes, cookies, tokens, or URLs are ever requested or printed.
-* **🧹 Clean Cloud:** The temporary folder created in your own Quark drive is deleted automatically after the download.
+* **🧹 Clean Cloud:** The temporary folder created in your own Quark drive is deleted automatically upon full success.
 * **🪟 Windows-Safe File Names:** Characters like `< > : " | ? *`, trailing dots/spaces, and reserved names (`CON`, `NUL`, …) are sanitized.
-* **✅ Verified Output:** Files are only considered complete when their byte size matches Quark's metadata.
+* **✅ Verified Output:** Files are only marked complete when their byte size matches Quark's metadata.
 
 ---
 
@@ -32,7 +37,7 @@ Paste a `pan.quark.cn/s/...` link, scan Quark's official QR login once, and down
 * **Python 3.10+**
 * **Chromium** (installed through Playwright — one command, shown below)
 * A **Quark account** and the **Quark mobile app** (to scan the login QR)
-* A graphical session for the first login (a browser window opens)
+* A graphical session for the first login (a browser window opens once for QR scan)
 
 Python dependencies (`playwright`, `requests`) are installed automatically.
 
@@ -98,18 +103,16 @@ python -m playwright install chromium
 quarkdl --help
 ```
 
-> Open a new terminal later? Activate the virtual environment again (`.\.venv\Scripts\Activate.ps1` on Windows, `source .venv/bin/activate` elsewhere) before running `quarkdl`. You can also run it as `python -m quarkdl.cli ...`.
-
 ---
 
 ## 🔑 First Run & Login
 
 1. Run any command, e.g. `quarkdl list "https://pan.quark.cn/s/your-share-id"`.
-2. A **Chromium window opens** on Quark's official page.
+2. A **Chromium window opens** on Quark's official login page.
 3. **Scan the QR code** with the official Quark mobile app.
-4. Your login is saved in `~/.quarkdl/browser-profile` (on Windows: `C:\Users\<you>\.quarkdl\browser-profile`), so later runs normally need no new scan until the login expires.
+4. Your verified login is saved in `~/.quarkdl/browser-profile/cookies.json`. Later runs start **instantly** without opening Chromium!
 
-If you take longer than 3 minutes to scan, raise the timeout (note: global options go **before** the command):
+If you need more time to scan on the first run:
 
 ```bash
 quarkdl --login-timeout 600 list "https://pan.quark.cn/s/your-share-id"
@@ -119,7 +122,7 @@ quarkdl --login-timeout 600 list "https://pan.quark.cn/s/your-share-id"
 
 ## 🧭 Usage
 
-Always wrap the link in **double quotes** so the shell doesn't mangle `?` and `#`.
+Always wrap the link in **double quotes** so your shell does not mangle `?` or `#`.
 
 ### Quick start
 
@@ -127,13 +130,13 @@ Always wrap the link in **double quotes** so the shell doesn't mangle `?` and `#
 # 1. See what's inside the share
 quarkdl list "https://pan.quark.cn/s/your-share-id"
 
-# 2. Download (asks which top-level entries you want; Enter = all)
+# 2. Download (prompts for selection; Enter = download all)
 quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads
 ```
 
 ### Share with a passcode
 
-Use the full link including the passcode:
+Use the full link including the passcode parameter:
 
 ```bash
 quarkdl download "https://pan.quark.cn/s/your-share-id#/list/share?pwd=1234" -o downloads
@@ -145,6 +148,26 @@ quarkdl download "https://pan.quark.cn/s/your-share-id#/list/share?pwd=1234" -o 
 quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --yes
 ```
 
+### Download multiple files at once
+
+Download 4 files concurrently:
+
+```bash
+quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --parallel-files 4
+```
+
+### Limit download speed
+
+Throttle bandwidth to avoid saturating your connection:
+
+```bash
+# Cap to 5 MiB/s
+quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --limit-rate 5M
+
+# Cap to 500 KiB/s
+quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --limit-rate 500K
+```
+
 ### Download a specific file from a folder
 
 **Option A — pick by number:**
@@ -153,21 +176,21 @@ quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --yes
 quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --pick
 ```
 
-Every file in the share is listed with a number. Enter comma-separated numbers (e.g. `3,7,12`) or press Enter for all.
+Lists every file in the share with a number. Enter comma-separated numbers (e.g. `3,7,12`) or press Enter for all.
 
-> Don't combine `--pick` with `--yes` — `--yes` wins and downloads everything.
+> Note: Do not combine `--pick` with `--yes` (`--yes` takes precedence).
 
-**Option B — pick by pattern:**
+**Option B — filter by glob pattern:**
 
 ```bash
 # one exact file
 quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --yes --include "**/episode05.mp4"
 
-# one file type inside one folder
+# one file type inside a specific folder
 quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --yes --include "**/Season 1/*.mkv"
 ```
 
-> **Start every `--include` / `--exclude` pattern with `**/`.** Patterns are matched against the path inside the temporary cloud folder, so `Season 1/*.mkv` will not match. Run `quarkdl list` to see the exact paths.
+> **Always start `--include` / `--exclude` patterns with `**/`.** Patterns match paths relative to the temporary cloud folder.
 
 ### Filter with include / exclude
 
@@ -178,27 +201,20 @@ quarkdl download "https://pan.quark.cn/s/your-share-id" \
   --exclude "**/preview/*"
 ```
 
-Both flags can be repeated.
-
 ### Tune speed and reliability
 
 ```bash
 quarkdl download "https://pan.quark.cn/s/your-share-id" \
   -o downloads \
   --workers 32 \
+  --parallel-files 3 \
   --chunk-size 1048576 \
   --retries 5
 ```
 
-### Keep the temporary cloud folder
-
-```bash
-quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --keep-cloud
-```
-
 ### Resume an interrupted download
 
-Just run the **same command again**. Finished files are skipped and completed chunks are reused.
+Just run the **same command again**. Finished files and completed chunks are recognized instantly and skipped. If a download was interrupted, the cloud folder is automatically preserved and reused.
 
 ---
 
@@ -212,13 +228,13 @@ quarkdl [global options] <command> [command options]
 
 | Option | Default | Description |
 |---|---|---|
-| `--profile-dir PATH` | `~/.quarkdl/browser-profile` | Browser profile that stores your Quark login |
-| `--headless` | off | Run the browser without a window. Not useful for the first QR login |
-| `--login-timeout SECONDS` | `180` | How long to wait for you to scan the QR code |
+| `--profile-dir PATH` | `~/.quarkdl/browser-profile` | Browser profile storing login state & cookie cache |
+| `--headless` | off | Run browser headless (not useful for first QR login) |
+| `--login-timeout SECONDS` | `180` | Timeout in seconds to wait for QR login scan |
 
 ### `quarkdl list <url>`
 
-Prints every folder and file in the share with sizes and totals. Nothing is downloaded or saved to your drive.
+Prints every folder and file in the share with sizes and totals. Nothing is saved or downloaded.
 
 ### `quarkdl download <url> [options]`
 
@@ -229,11 +245,13 @@ Prints every folder and file in the share with sizes and totals. Nothing is down
 | `--pick` | off | Interactively choose individual files |
 | `--include GLOB` | all files | Only download matching paths. Repeatable. Start with `**/` |
 | `--exclude GLOB` | none | Skip matching paths. Repeatable. Start with `**/` |
-| `--workers N` | `32` | Parallel range connections per file (must be ≥ 1) |
-| `--chunk-size BYTES` | `1048576` (1 MiB) | Size of each range chunk (must be ≥ 1) |
-| `--retries N` | `5` | Attempts per chunk / file before giving up (must be ≥ 1) |
-| `--keep-cloud` | off | Don't delete the temporary folder from your Quark drive |
-| `--temp-folder NAME` | `quarkdl-<share-id>-<timestamp>` | Name of the temporary cloud folder |
+| `--parallel-files N` | `1` | Number of files to download concurrently |
+| `--workers N` | `32` | Total concurrent range workers |
+| `--chunk-size BYTES` | `1048576` (1 MiB) | Range chunk size in bytes |
+| `--limit-rate SPEED` | unlimited | Bandwidth cap (e.g. `5M`, `500K`, `10MB/s`) |
+| `--retries N` | `5` | Attempts per chunk/file before giving up |
+| `--keep-cloud` | off | Keep the temporary cloud folder in Quark drive |
+| `--temp-folder NAME` | `quarkdl-<id>-<time>` | Temporary cloud folder name |
 
 **Exit codes:** `0` success · `1` error or at least one file failed.
 
@@ -250,15 +268,15 @@ Prints every folder and file in the share with sizes and totals. Nothing is down
  └── .quarkdl-status.json      ← progress state (filenames + sizes; keep private)
 ```
 
-While a download is running you may also see:
+While downloading, you may see:
 
 | Item | Meaning |
 |---|---|
-| `file.ext.part` | A partially downloaded small file (resumes automatically) |
-| `file.ext.chunks/` | Completed chunks of a large file, removed after assembly |
-| `file.ext.size_mismatch_<N>` | An existing file with the wrong size that was moved aside |
+| `file.ext.part` | Preallocated target file receiving chunks in-place |
+| `file.ext.meta` | Lightweight JSON manifest recording completed chunk indices |
+| `file.ext.size_mismatch_<N>` | Existing file with unexpected size moved aside safely |
 
-Progress looks like this (updates about once per second):
+Progress updates every ~1s with rolling speed and overall ETA:
 
 ```text
 [2/5] My Share Folder/video02.mkv (734003200 bytes)
@@ -270,13 +288,15 @@ Transferred 1.9 GiB in 3m41s (avg 8.8 MiB/s)
 
 ## ⚙️ How It Works
 
-1. Reads the share through Quark's web API using your own login.
-2. Saves the chosen top-level entries into a **temporary folder in your own Quark drive** (web share downloads often reject large files, and generated CDN links are cookie-bound).
-3. Requests a download link per file through the desktop-client-style endpoint.
-4. Downloads large files as parallel range chunks, small files as a single resumable stream.
-5. Assembles chunks, verifies byte sizes, then **deletes the temporary cloud folder**.
-
-> Quark can only save whole top-level entries. To get one file out of a folder, the whole top-level folder is copied to your temporary cloud folder first, but only your selected files are downloaded. Make sure your Quark drive has enough free space for it.
+1. **Auth:** Uses cached browser cookies for instant startup; refreshes via Playwright QR flow only when expired.
+2. **Cloud Staging:** Saves selected share entries into a temporary folder in your Quark drive.
+3. **Link Minting:** Fetches authorized download URLs through desktop-client endpoints with automatic refresh on expiration.
+4. **Direct-to-File In-Place Streaming:**
+   - Preallocates the `.part` file to expected size.
+   - Range workers fetch 1 MiB chunks and write directly to their byte offsets under a fast mutex lock.
+   - Tracks completed chunks in `.meta`.
+   - On completion, instantly renames `.part` → final file with **zero assembly** and **zero extra disk space**.
+5. **Clean Cloud:** Deletes the temporary cloud folder automatically upon 100% completion (or preserves it for seamless resume if interrupted).
 
 ---
 
@@ -284,50 +304,37 @@ Transferred 1.9 GiB in 3m41s (avg 8.8 MiB/s)
 
 | Problem | Fix |
 |---|---|
-| `quarkdl` is not recognized | Activate the virtual environment, or run `python -m quarkdl.cli ...` |
-| PowerShell blocks `Activate.ps1` | `Set-ExecutionPolicy -Scope Process Bypass` |
-| *Executable doesn't exist* / browser missing | `python -m playwright install chromium` |
-| `Timed out waiting for Quark QR login` | Scan faster or use `--login-timeout 600` |
-| Login asked again every run | Make sure `--profile-dir` points to the same folder each time |
-| Download is slow | Speed is limited by Quark / CDN / account throttling. Try `--workers 16` (too many connections can get throttled) |
-| `HTTP 403` / link expired | Handled automatically with a fresh link; if it persists, re-run the command |
-| *cloud cleanup failed* | Delete the `quarkdl-<share-id>-<timestamp>` folder manually in the Quark app |
-| `--include` matches nothing | Start the pattern with `**/` and check paths with `quarkdl list` |
-| Some files failed | They are listed at the end. Re-run the same command to resume |
+| `quarkdl` is not recognized | Activate virtual environment, or run `python -m quarkdl.cli ...` |
+| PowerShell blocks `Activate.ps1` | Run `Set-ExecutionPolicy -Scope Process Bypass` |
+| Chromium missing | Run `python -m playwright install chromium` |
+| `Timed out waiting for Quark QR login` | Use `--login-timeout 600` |
+| Speed is slow | Try `--workers 16` or `--parallel-files 2` (excessive connections can be throttled by CDN) |
+| `HTTP 403` / link expired | Handled automatically with fresh link minting |
+| Cloud cleanup failed | Delete `quarkdl-<id>-<time>` folder manually in Quark web/app |
+| `--include` matches nothing | Start patterns with `**/` and check paths with `quarkdl list` |
+| Download was interrupted | Re-run the exact same command — it reuses the cloud folder and resumes chunks |
 
 ---
 
 ## 🔒 Safety Notes
 
-* Login happens through Quark's official web page and app QR flow.
-* Login state is stored locally in your Playwright profile directory.
-* The tool does not print raw cookies, `stoken`, generated download URLs, or account credentials.
-* `.quarkdl-status.json` can contain filenames and sizes — keep it private if filenames are sensitive.
-* Temporary cloud folders are named `quarkdl-<share-id>-<timestamp>` and deleted by default.
-
----
-
-## ⚠️ Limitations
-
-* Alpha tool built around observed Quark web/desktop endpoints; Quark may change them.
-* The first QR login needs a graphical browser session (headless servers need a desktop or X forwarding).
-* Download speed is subject to Quark / CDN / account throttling.
-* Large files are assembled from chunks at the end, so you need roughly **2× the file size** in free disk space while it finishes.
-* Files are downloaded one after another (each file uses many parallel connections).
-* If a download fails, the temporary cloud folder is still deleted, so a re-run saves the share again.
+* Login happens strictly through Quark's official web page and app QR flow.
+* Stored locally in your Playwright profile directory.
+* Never prints cookies, tokens, or private URLs.
+* Temporary cloud folders are auto-deleted upon successful completion.
 
 ---
 
 ## 🗺️ Ideas / Roadmap
 
-Not implemented yet:
-
-* Write chunks directly into a preallocated file (no assembly step, no 2× disk use)
-* Download several files at once
-* `--limit-rate` bandwidth cap
-* Dynamic chunk splitting so no connection sits idle at the end of a file
-* Cached login so the browser only opens when the session has expired
-* Keep and reuse the cloud folder after a failure
+- [x] Connection pooling & keep-alive reuse
+- [x] Direct-to-file in-place chunk writing (zero assembly, no 2× disk space)
+- [x] Multi-file parallel downloads (`--parallel-files`)
+- [x] Bandwidth throttle (`--limit-rate`)
+- [x] Fast cookie caching & browser skip
+- [x] Cloud folder preservation on interruption & automatic reuse
+- [ ] Dynamic chunk splitting / work stealing at download tail
+- [ ] Direct download from user's personal drive (without share link)
 
 ---
 
@@ -342,13 +349,13 @@ pytest -q
 ```text
 📂 Quark-Downloader/
  ├── src/quarkdl/
- │   ├── cli.py          ← commands & flags
- │   ├── api.py          ← Quark API client
- │   ├── browser.py      ← Playwright QR login
- │   ├── downloader.py   ← range downloads, retries, resume
- │   ├── progress.py     ← speed / ETA reporter
+ │   ├── cli.py          ← CLI commands & argument parsing
+ │   ├── api.py          ← Quark Cloud Drive API client
+ │   ├── browser.py      ← Playwright QR login & cookie caching
+ │   ├── downloader.py   ← in-place range downloader, pool, rate limiter
+ │   ├── progress.py     ← thread-safe progress, speed & ETA reporter
  │   └── core.py         ← URL parsing, path sanitizing, helpers
- └── tests/              ← unit tests + local HTTP-server tests
+ └── tests/              ← unit tests & local HTTP Range server tests
 ```
 
 ---

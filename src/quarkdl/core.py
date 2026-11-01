@@ -131,3 +131,45 @@ def human_bytes(value: int) -> str:
                 return f"{int(amount)} B"
             return f"{amount:.1f} {unit}"
         amount /= 1024
+
+
+def parse_rate_limit(value: str) -> int:
+    """Parse strings like '5M', '500K', '10MB/s', '1048576' into bytes per second."""
+    raw = value.strip().upper()
+    if not raw:
+        raise ValueError("rate limit cannot be empty")
+    if raw.endswith("B/S") or raw.endswith("BPS"):
+        raw = raw[:-3].rstrip("/")
+    elif raw.endswith("/S"):
+        raw = raw[:-2]
+
+    multiplier = 1
+    if raw.endswith("KIB") or raw.endswith("KB"):
+        multiplier = 1024
+        raw = raw.rstrip("KIB").rstrip("KB")
+    elif raw.endswith("MIB") or raw.endswith("MB"):
+        multiplier = 1024 * 1024
+        raw = raw.rstrip("MIB").rstrip("MB")
+    elif raw.endswith("GIB") or raw.endswith("GB"):
+        multiplier = 1024 * 1024 * 1024
+        raw = raw.rstrip("GIB").rstrip("GB")
+    elif raw.endswith("K"):
+        multiplier = 1024
+        raw = raw[:-1]
+    elif raw.endswith("M"):
+        multiplier = 1024 * 1024
+        raw = raw[:-1]
+    elif raw.endswith("G"):
+        multiplier = 1024 * 1024 * 1024
+        raw = raw[:-1]
+    elif raw.endswith("B"):
+        multiplier = 1
+        raw = raw[:-1]
+
+    try:
+        rate = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid rate limit: {value!r}") from exc
+    if rate <= 0:
+        raise ValueError("rate limit must be > 0")
+    return int(rate * multiplier)

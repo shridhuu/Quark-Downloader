@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from .core import (
     DownloadItem,
     ShareLink,
     human_bytes,
+    parse_rate_limit,
     parse_share_url,
     plan_ranges,
     sanitize_rel_path,
@@ -12,6 +15,7 @@ __all__ = [
     "DownloadItem",
     "ShareLink",
     "human_bytes",
+    "parse_rate_limit",
     "parse_share_url",
     "plan_ranges",
     "sanitize_rel_path",

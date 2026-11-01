@@ -84,3 +84,33 @@ def test_sanitize_rel_path_makes_names_windows_safe(raw, expected):
 def test_sanitize_rel_path_rejects_names_that_vanish():
     with pytest.raises(ValueError, match="no usable file name"):
         sanitize_rel_path("...")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1048576", 1048576),
+        ("500K", 500 * 1024),
+        ("500kb", 500 * 1024),
+        ("500KiB", 500 * 1024),
+        ("10M", 10 * 1024 * 1024),
+        ("10MB", 10 * 1024 * 1024),
+        ("10MiB", 10 * 1024 * 1024),
+        ("1.5M", int(1.5 * 1024 * 1024)),
+        ("10MB/s", 10 * 1024 * 1024),
+        ("2000B/s", 2000),
+        ("1G", 1024 * 1024 * 1024),
+    ],
+)
+def test_parse_rate_limit_valid_units(raw, expected):
+    from quarkdl.core import parse_rate_limit
+
+    assert parse_rate_limit(raw) == expected
+
+
+def test_parse_rate_limit_invalid_raises():
+    from quarkdl.core import parse_rate_limit
+
+    for bad in ("", "   ", "abc", "-5M", "0", "0M"):
+        with pytest.raises(ValueError):
+            parse_rate_limit(bad)

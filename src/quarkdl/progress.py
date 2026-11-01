@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -64,7 +65,7 @@ class ProgressReporter:
     """Progress callback printing per-file and overall progress, speed and ETA.
 
     The first callback for a file only establishes its baseline (bytes already on disk from a
-    previous run), so resumed or skipped files do not inflate the measured speed.
+    previous run), so resumed or skipped files do not inflate the measured speed. Thread-safe.
     """
 
     def __init__(
@@ -84,23 +85,26 @@ class ProgressReporter:
         self._seen: dict[str, int] = {}
         self._overall_done = 0
         self._last_emit = float("-inf")
+        self._lock = threading.Lock()
 
     def __call__(self, item: DownloadItem, done: int, total: int) -> None:
         key = item.fid or item.path
-        previous = self._seen.get(key)
-        self._seen[key] = done
-        if previous is None:
-            self._overall_done += done
-            return
-        delta = done - previous
-        self._overall_done += delta
-        self._meter.add(delta)
+        with self._lock:
+            previous = self._seen.get(key)
+            self._seen[key] = done
+            if previous is None:
+                self._overall_done += done
+                return
+            delta = done - previous
+            self._overall_done += delta
+            self._meter.add(delta)
 
-        now = self._clock()
-        finished = total > 0 and done >= total
-        if finished or now - self._last_emit >= self._interval:
-            self._emit(self._format(item, done, total))
-            self._last_emit = now
+            now = self._clock()
+            finished = total > 0 and done >= total
+            if finished or now - self._last_emit >= self._interval:
+                msg = self._format(item, done, total)
+                self._last_emit = now
+                self._emit(msg)
 
     def _format(self, item: DownloadItem, done: int, total: int) -> str:
         pct = 100 * done / total if total else 100.0
@@ -115,9 +119,9 @@ class ProgressReporter:
         return f"{line} | {item.path}"
 
     def summary(self) -> str:
-        return (
-            f"Transferred {human_bytes(self._meter.total)} in "
-            f"{format_duration(self._meter.elapsed())} "
-            f"(avg {human_bytes(int(self._meter.average_speed()))}/s)"
-        )
-
+        with self._lock:
+            return (
+                f"Transferred {human_bytes(self._meter.total)} in "
+                f"{format_duration(self._meter.elapsed())} "
+                f"(avg {human_bytes(int(self._meter.average_speed()))}/s)"
+            )
