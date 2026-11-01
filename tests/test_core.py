@@ -114,3 +114,21 @@ def test_parse_rate_limit_invalid_raises():
     for bad in ("", "   ", "abc", "-5M", "0", "0M"):
         with pytest.raises(ValueError):
             parse_rate_limit(bad)
+
+
+def test_parse_index_selection_numbers_and_ranges():
+    from quarkdl.core import parse_index_selection
+
+    assert parse_index_selection("1, 3, 5-8", 10) == {1, 3, 5, 6, 7, 8}
+    assert parse_index_selection("2-4", 10) == {2, 3, 4}
+    assert parse_index_selection("5-3", 10) == {3, 4, 5}
+    assert parse_index_selection("all", 4) == {1, 2, 3, 4}
+    assert parse_index_selection("ALL", 3) == {1, 2, 3}
+    assert parse_index_selection("", 3) == {1, 2, 3}
+
+
+def test_parse_index_selection_filters_out_of_bounds_and_bad_input():
+    from quarkdl.core import parse_index_selection
+
+    assert parse_index_selection("0, 1, 2, 99", 5) == {1, 2}
+    assert parse_index_selection("invalid, 3, 1-2", 5) == {1, 2, 3}

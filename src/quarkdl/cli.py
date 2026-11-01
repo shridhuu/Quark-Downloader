@@ -9,7 +9,9 @@ from .api import QuarkApi, QuarkApiError, ShareEntry
 from .browser import BrowserLoginError, ensure_quark_login
 from .core import (
     DownloadItem,
+    ShareLink,
     human_bytes,
+    parse_index_selection,
     parse_rate_limit,
     parse_share_url,
     sanitize_rel_path,
@@ -52,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    list_parser = sub.add_parser("list", help="List a share")
+    list_parser = sub.add_parser("list", help="List a share and optionally download items")
     list_parser.add_argument("url", help="https://pan.quark.cn/s/... share link")
 
     download = sub.add_parser("download", help="Download a share")
@@ -125,19 +127,55 @@ def main(argv: list[str] | None = None) -> int:
 def command_list(api: QuarkApi, url: str) -> int:
     link = parse_share_url(url)
     stoken = api.get_stoken(link.pwd_id, link.passcode)
-    entries = api.walk_share(link.pwd_id, stoken)
-    files = [entry for entry in entries if not entry.is_dir]
-    folders = [entry for entry in entries if entry.is_dir]
+    root_entries = api.list_share_folder(link.pwd_id, stoken)
+    all_entries = api.walk_share(link.pwd_id, stoken)
+    files = [entry for entry in all_entries if not entry.is_dir]
+    folders = [entry for entry in all_entries if entry.is_dir]
     total_size = human_bytes(sum(file.size for file in files))
     print(
-        f"Share {link.pwd_id}: {len(folders)} folders, "
-        f"{len(files)} files, {total_size}"
+        f"\nShare {link.pwd_id}: {len(folders)} folders, "
+        f"{len(files)} files, {total_size}\n"
     )
-    for entry in entries:
-        marker = "DIR " if entry.is_dir else "FILE"
-        size = "-" if entry.is_dir else human_bytes(entry.size)
-        print(f"{marker:4} {size:>10}  {entry.path}")
-    return 0
+    for idx, entry in enumerate(files, 1):
+        print(f"  [{idx:>3}] {human_bytes(entry.size):>10}  {entry.path}")
+
+    # In a non-interactive shell/pipe, just return cleanly
+    if not sys.stdin.isatty() or not files:
+        return 0
+
+    print()
+    raw = input(
+        "Download from this list? (e.g. 1-3, 5, 'all', or press Enter to exit): "
+    ).strip()
+    if not raw:
+        return 0
+
+    indexes = parse_index_selection(raw, len(files))
+    if not indexes:
+        print("Nothing selected.")
+        return 0
+
+    selected_file_paths = {entry.path for idx, entry in enumerate(files, 1) if idx in indexes}
+    selected_roots = roots_covering_file_paths(root_entries, selected_file_paths)
+    out_dir_str = input("Download directory [downloads]: ").strip()
+    output_dir = Path(out_dir_str) if out_dir_str else Path("downloads")
+
+    download_args = argparse.Namespace(
+        url=url,
+        output=output_dir,
+        yes=True,
+        pick=False,
+        include=[],
+        exclude=[],
+        workers=32,
+        parallel_files=1,
+        chunk_size=1024 * 1024,
+        retries=DEFAULT_RETRIES,
+        limit_rate=None,
+        keep_cloud=False,
+        temp_folder="",
+    )
+    return _execute_download(api, link, stoken, selected_roots, selected_file_paths, download_args)
 
 
 def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
@@ -152,13 +190,10 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
     )
 
     selected_file_paths: set[str] | None = None
-    selected_rel_paths: set[str] = set()
     if args.yes:
         selected_roots = root_entries
     elif args.pick:
         selected_file_paths = _prompt_file_selection(all_files)
-        # Downloaded paths are sanitized (e.g. ':' -> '_'), so compare in sanitized form.
-        selected_rel_paths = {sanitize_rel_path(p).as_posix() for p in selected_file_paths}
         selected_roots = roots_covering_file_paths(root_entries, selected_file_paths)
     else:
         selected_roots = _prompt_root_selection(root_entries)
@@ -166,6 +201,17 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
         print("Nothing selected.")
         return 0
 
+    return _execute_download(api, link, stoken, selected_roots, selected_file_paths, args)
+
+
+def _execute_download(
+    api: QuarkApi,
+    link: ShareLink,
+    stoken: str,
+    selected_roots: list[ShareEntry],
+    selected_file_paths: set[str] | None,
+    args: argparse.Namespace,
+) -> int:
     temp_name = args.temp_folder or f"quarkdl-{link.pwd_id}-{time.strftime('%Y%m%d-%H%M%S')}"
     existing_folders = {item.name: item.fid for item in api.list_drive_folder("0") if item.is_dir}
     if temp_name in existing_folders:
@@ -186,6 +232,8 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
         drive_items = api.walk_drive_folder(temp_fid, temp_name)
         files = [item for item in drive_items if not item.is_dir]
         if selected_file_paths is not None:
+            # Downloaded paths are sanitized (e.g. ':' -> '_'), so compare in sanitized form.
+            selected_rel_paths = {sanitize_rel_path(p).as_posix() for p in selected_file_paths}
             files = [
                 item
                 for item in files
@@ -255,15 +303,8 @@ def _prompt_root_selection(entries: list[ShareEntry]) -> list[ShareEntry]:
         kind = "folder" if entry.is_dir else "file"
         size = "-" if entry.is_dir else human_bytes(entry.size)
         print(f"  {idx:>2}. {kind:6} {size:>10}  {entry.file_name}")
-    raw = input("Select entries (all, or comma-separated numbers) [all]: ").strip()
-    if not raw or raw.lower() in {"a", "all"}:
-        return entries
-    indexes: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        indexes.add(int(part))
+    raw = input("Select entries (all, or numbers/ranges like 1,3,5-8) [all]: ").strip()
+    indexes = parse_index_selection(raw, len(entries))
     return [entry for idx, entry in enumerate(entries, 1) if idx in indexes]
 
 
@@ -272,15 +313,8 @@ def _prompt_file_selection(entries: list[ShareEntry]) -> set[str]:
     print("Files:")
     for idx, entry in enumerate(files, 1):
         print(f"  {idx:>3}. {human_bytes(entry.size):>10}  {entry.path}")
-    raw = input("Select files (all, or comma-separated numbers) [all]: ").strip()
-    if not raw or raw.lower() in {"a", "all"}:
-        return {entry.path for entry in files}
-    indexes: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        indexes.add(int(part))
+    raw = input("Select files (all, or numbers/ranges like 1,3,5-8) [all]: ").strip()
+    indexes = parse_index_selection(raw, len(files))
     return {entry.path for idx, entry in enumerate(files, 1) if idx in indexes}
 
 

@@ -145,14 +145,28 @@ quarkdl --login-timeout 600 list "https://pan.quark.cn/s/your-share-id"
 
 Always wrap the link in **double quotes** so your shell does not mangle `?` or `#`.
 
-### Quick start
+### Quick start (Interactive List & Download)
+
+The simplest way is running `main.py` directly:
 
 ```bash
-# 1. See what's inside the share
-quarkdl list "https://pan.quark.cn/s/your-share-id"
+# Run interactive wizard (prompts for URL -> displays list -> choose items to download)
+python main.py
 
-# 2. Download (prompts for selection; Enter = download all)
-quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads
+# Or pass the URL directly to list files and download on the spot:
+python main.py "https://pan.quark.cn/s/your-share-id"
+```
+
+You can enter numbers or ranges like `1-3, 5` or `all` to download immediately from the displayed list.
+
+### Download via command line flags
+
+```bash
+# 1. Download all files without prompts
+quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --yes
+
+# 2. Pick specific files interactively (supports 1-5, 8, all)
+quarkdl download "https://pan.quark.cn/s/your-share-id" -o downloads --pick
 ```
 
 ### Share with a passcode

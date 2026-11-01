@@ -173,3 +173,33 @@ def parse_rate_limit(value: str) -> int:
     if rate <= 0:
         raise ValueError("rate limit must be > 0")
     return int(rate * multiplier)
+
+
+def parse_index_selection(raw: str, max_count: int) -> set[int]:
+    """Parse strings like '1, 3, 5-8', 'all', '1-3' into a set of 1-based indices."""
+    raw = raw.strip()
+    if not raw or raw.lower() in {"a", "all"}:
+        return set(range(1, max_count + 1))
+    indexes: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            pieces = part.split("-", 1)
+            try:
+                start = int(pieces[0].strip())
+                end = int(pieces[1].strip())
+                for idx in range(min(start, end), max(start, end) + 1):
+                    if 1 <= idx <= max_count:
+                        indexes.add(idx)
+            except ValueError:
+                continue
+        else:
+            try:
+                idx = int(part)
+                if 1 <= idx <= max_count:
+                    indexes.add(idx)
+            except ValueError:
+                continue
+    return indexes
