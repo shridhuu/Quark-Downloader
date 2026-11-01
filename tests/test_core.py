@@ -65,3 +65,22 @@ def test_select_items_supports_include_and_exclude_globs():
 def test_human_bytes_uses_binary_units():
     assert human_bytes(1024) == "1.0 KiB"
     assert human_bytes(5 * 1024 * 1024) == "5.0 MiB"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('root/a:b?c*d"e<f>g|h.txt', "root/a_b_c_d_e_f_g_h.txt"),
+        ("root/name. /file.txt", "root/name/file.txt"),
+        ("root/CON/aux.txt/nul", "root/_CON/_aux.txt/_nul"),
+        ("root/com1.tar.gz", "root/_com1.tar.gz"),
+        ("root/console.txt", "root/console.txt"),
+    ],
+)
+def test_sanitize_rel_path_makes_names_windows_safe(raw, expected):
+    assert sanitize_rel_path(raw) == Path(expected)
+
+
+def test_sanitize_rel_path_rejects_names_that_vanish():
+    with pytest.raises(ValueError, match="no usable file name"):
+        sanitize_rel_path("...")

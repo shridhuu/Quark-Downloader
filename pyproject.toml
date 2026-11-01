@@ -3,13 +3,13 @@ requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
-name = "quark-drive-resumable-downloader"
+name = "quark-downloader"
 version = "0.1.0"
 description = "Local-first resumable downloader for authorized Quark Cloud Drive shares"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "quark-drive-resumable-downloader contributors"}]
+authors = [{name = "Shridhuu"}]
 keywords = ["quark", "cloud-drive", "downloader", "resumable", "playwright"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -36,15 +36,16 @@ dev = [
 quarkdl = "quarkdl.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/Noyv3x/quark-drive-resumable-downloader"
-Repository = "https://github.com/Noyv3x/quark-drive-resumable-downloader"
-Issues = "https://github.com/Noyv3x/quark-drive-resumable-downloader/issues"
+Homepage = "https://github.com/shridhuu/Quark-Downloader"
+Repository = "https://github.com/shridhuu/Quark-Downloader"
+Issues = "https://github.com/shridhuu/Quark-Downloader/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/quarkdl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100

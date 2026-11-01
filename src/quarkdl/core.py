@@ -44,6 +44,27 @@ def parse_share_url(url: str) -> ShareLink:
     return ShareLink(pwd_id=parts[1], passcode=passcode)
 
 
+_WINDOWS_INVALID_CHARS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+
+def _clean_component(part: str) -> str:
+    """Make one path component safe on Windows (and harmless elsewhere)."""
+    cleaned = "".join(
+        "_" if ord(ch) < 32 or ord(ch) == 127 or ch in _WINDOWS_INVALID_CHARS else ch
+        for ch in part
+    )
+    # Windows silently drops trailing dots/spaces, which can collide or fail.
+    cleaned = cleaned.rstrip(" .")
+    if cleaned and cleaned.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    return cleaned
+
+
 def sanitize_rel_path(path: str, temp_parent: str | None = None) -> Path:
     normalized = path.replace("\\", "/")
     if temp_parent:
@@ -59,7 +80,7 @@ def sanitize_rel_path(path: str, temp_parent: str | None = None) -> Path:
         part = raw.strip()
         if not part or part in {".", ".."} or (temp_component and part == temp_component):
             continue
-        cleaned = "".join("_" if ord(ch) < 32 or ord(ch) == 127 else ch for ch in part)
+        cleaned = _clean_component(part)
         if cleaned:
             parts.append(cleaned)
     if not parts:

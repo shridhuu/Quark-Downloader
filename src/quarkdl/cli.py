@@ -8,9 +8,17 @@ from pathlib import Path
 from .api import QuarkApi, QuarkApiError, ShareEntry
 from .browser import BrowserLoginError, ensure_quark_login
 from .core import DownloadItem, human_bytes, parse_share_url, sanitize_rel_path, select_items
-from .downloader import ResumableDownloader
+from .downloader import DEFAULT_RETRIES, DownloadError, ResumableDownloader
+from .progress import ProgressReporter
 
 DEFAULT_PROFILE = Path.home() / ".quarkdl" / "browser-profile"
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return number
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,10 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     download.add_argument("--exclude", action="append", default=[], help="Exclude glob, repeatable")
     download.add_argument(
-        "--workers", type=int, default=32, help="Concurrent range workers per file"
+        "--workers", type=_positive_int, default=32, help="Concurrent range workers per file"
     )
     download.add_argument(
-        "--chunk-size", type=int, default=1024 * 1024, help="Range chunk size in bytes"
+        "--chunk-size", type=_positive_int, default=1024 * 1024, help="Range chunk size in bytes"
+    )
+    download.add_argument(
+        "--retries",
+        type=_positive_int,
+        default=DEFAULT_RETRIES,
+        help="Attempts per chunk/file before giving up (default: %(default)s)",
     )
     download.add_argument(
         "--keep-cloud", action="store_true", help="Keep temporary folder in your Quark drive"
@@ -84,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "download":
             return command_download(api, args)
         return 2
-    except (BrowserLoginError, QuarkApiError, KeyboardInterrupt, ValueError) as exc:
+    except (BrowserLoginError, QuarkApiError, DownloadError, KeyboardInterrupt, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
@@ -119,10 +133,13 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
     )
 
     selected_file_paths: set[str] | None = None
+    selected_rel_paths: set[str] = set()
     if args.yes:
         selected_roots = root_entries
     elif args.pick:
         selected_file_paths = _prompt_file_selection(all_files)
+        # Downloaded paths are sanitized (e.g. ':' -> '_'), so compare in sanitized form.
+        selected_rel_paths = {sanitize_rel_path(p).as_posix() for p in selected_file_paths}
         selected_roots = roots_covering_file_paths(root_entries, selected_file_paths)
     else:
         selected_roots = _prompt_root_selection(root_entries)
@@ -144,7 +161,7 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
             files = [
                 item
                 for item in files
-                if sanitize_rel_path(item.path, temp_name).as_posix() in selected_file_paths
+                if sanitize_rel_path(item.path, temp_name).as_posix() in selected_rel_paths
             ]
         files = select_items(files, include=args.include or None, exclude=args.exclude or None)
         if not files:
@@ -160,8 +177,23 @@ def command_download(api: QuarkApi, args: argparse.Namespace) -> int:
             temp_parent=temp_name,
             chunk_size=args.chunk_size,
             workers=args.workers,
+            retries=args.retries,
         )
-        downloader.download_many(files, progress=_progress)
+        reporter = ProgressReporter(total_bytes=total_size)
+        try:
+            failures = downloader.download_many(files, progress=reporter)
+        finally:
+            downloader.close()
+        print(reporter.summary())
+        if failures:
+            print(f"{len(failures)} file(s) failed:", file=sys.stderr)
+            for item, error in failures:
+                print(f"  {item.path}: {error}", file=sys.stderr)
+            print(
+                "Re-run the same command to resume; completed files and chunks are kept.",
+                file=sys.stderr,
+            )
+            return 1
         _verify_output(args.output, temp_name, files)
         print("All files downloaded and byte-size verified.")
         return 0
@@ -232,11 +264,6 @@ def _confirm(question: str, default: bool = True) -> bool:
     if not raw:
         return default
     return raw in {"y", "yes"}
-
-
-def _progress(item: DownloadItem, done: int, total: int) -> None:
-    pct = 100 * done / total if total else 100
-    print(f"  {pct:5.1f}% {human_bytes(done)}/{human_bytes(total)} {item.path}")
 
 
 def _verify_output(output: Path, temp_parent: str, items: list[DownloadItem]) -> None:
