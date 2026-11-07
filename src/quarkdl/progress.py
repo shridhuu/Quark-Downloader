@@ -86,6 +86,22 @@ class ProgressReporter:
         self._overall_done = 0
         self._last_emit = float("-inf")
         self._lock = threading.Lock()
+        self._wire_mode = False
+        self._extra: Callable[[], str] | None = None
+
+    def set_extra(self, extra: Callable[[], str] | None) -> None:
+        """Register a callable whose text (e.g. ``conn 28/32``) is appended to each line."""
+        self._extra = extra
+
+    def record_bytes(self, nbytes: int) -> None:
+        """Feed bytes as they arrive off the network.
+
+        Once used, speed comes from these per-block samples instead of per-chunk completions,
+        which arrive in bursts and made the displayed speed jump up and down.
+        """
+        with self._lock:
+            self._wire_mode = True
+            self._meter.add(nbytes)
 
     def __call__(self, item: DownloadItem, done: int, total: int) -> None:
         key = item.fid or item.path
@@ -97,7 +113,8 @@ class ProgressReporter:
                 return
             delta = done - previous
             self._overall_done += delta
-            self._meter.add(delta)
+            if not self._wire_mode:
+                self._meter.add(delta)
 
             now = self._clock()
             finished = total > 0 and done >= total
@@ -116,6 +133,8 @@ class ProgressReporter:
             overall_pct = min(100 * self._overall_done / self._total_bytes, 100.0)
             eta = format_duration(remaining / speed) if speed > 0 else "--"
             line += f" | all {overall_pct:5.1f}% ETA {eta}"
+        if self._extra is not None:
+            line += f" | {self._extra()}"
         return f"{line} | {item.path}"
 
     def summary(self) -> str:

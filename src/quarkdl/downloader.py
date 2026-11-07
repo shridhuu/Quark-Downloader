@@ -25,6 +25,21 @@ STATUS_SAVE_INTERVAL = 5.0
 AUTH_EXPIRED_CODES = (401, 403)
 MAX_RETRY_AFTER = 60.0
 
+# A connection that stops delivering data is abandoned after READ_TIMEOUT seconds (it used to
+# be 180, which let one stalled connection hold a worker slot for three minutes).
+CONNECT_TIMEOUT = 15.0
+READ_TIMEOUT = 20.0
+# A connection that is alive but crawling (below MIN_CONNECTION_SPEED bytes/s once
+# SLOW_GRACE_SECONDS have passed) is dropped and re-opened, keeping the bytes it already got.
+# After MAX_SLOW_RESTARTS restarts a chunk is allowed to finish at whatever speed it gets, so a
+# uniformly throttled CDN cannot make every connection restart forever.
+SLOW_GRACE_SECONDS = 5.0
+MIN_CONNECTION_SPEED = 16 * 1024
+MAX_SLOW_RESTARTS = 3
+# iter_content() only yields once this many bytes have arrived, so this is also the granularity
+# of speed accounting and slow-connection detection. Small keeps both responsive.
+READ_BLOCK_SIZE = 16 * 1024
+
 
 class DownloadError(RuntimeError):
     pass
@@ -55,6 +70,48 @@ class RateLimiter:
                 needed = nbytes - self._tokens
                 sleep_time = min(needed / self.rate, 0.1)
                 time.sleep(sleep_time)
+
+
+class _TransferMonitor:
+    """Thread-safe view of what the network side is doing right now.
+
+    Tracks how many CDN connections are open, how often a slow connection was replaced, and
+    forwards every received block to ``on_bytes`` so speed can be measured per block instead of
+    per finished chunk (chunks finish in bursts, which made the displayed speed jump around).
+    """
+
+    def __init__(self, on_bytes: Callable[[int], None] | None = None) -> None:
+        self._on_bytes = on_bytes
+        self._lock = threading.Lock()
+        self.active = 0
+        self.slow_restarts = 0
+
+    def add_bytes(self, nbytes: int) -> None:
+        if self._on_bytes is not None:
+            self._on_bytes(nbytes)
+
+    def note_slow_restart(self) -> None:
+        with self._lock:
+            self.slow_restarts += 1
+
+    @contextmanager
+    def connection(self) -> Iterator[None]:
+        with self._lock:
+            self.active += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+@contextmanager
+def _tracked(monitor: _TransferMonitor | None) -> Iterator[None]:
+    if monitor is None:
+        yield
+    else:
+        with monitor.connection():
+            yield
 
 
 class _SessionPool:
@@ -133,6 +190,7 @@ class ResumableDownloader:
         retries: int = DEFAULT_RETRIES,
         rate_limit: int | None = None,
         status_path: Path | None = None,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> None:
         self.api = api
         self.output_dir = output_dir
@@ -149,6 +207,17 @@ class ResumableDownloader:
         self._last_status_save = 0.0
         self._conn_semaphore = threading.BoundedSemaphore(self.workers)
         self._status_lock = threading.Lock()
+        self._monitor = _TransferMonitor(on_bytes)
+
+    @property
+    def active_connections(self) -> int:
+        """Number of CDN connections currently open."""
+        return self._monitor.active
+
+    @property
+    def slow_restarts(self) -> int:
+        """How many crawling connections were dropped and re-opened so far."""
+        return self._monitor.slow_restarts
 
     def close(self) -> None:
         if self._pool is not None:
@@ -294,38 +363,46 @@ class ResumableDownloader:
                 headers["Range"] = f"bytes={existing}-"
             retry_after: float | None = None
             try:
-                with self._conn_semaphore:
-                    with self.api.session.get(
-                        url, headers=headers, stream=True, timeout=(30, 180)
-                    ) as response:
-                        code = response.status_code
-                        if code in AUTH_EXPIRED_CODES:
-                            last_error = f"HTTP {code} (download link expired?)"
-                            url = urls.refresh(url)
-                        elif code not in (200, 206):
-                            last_error = f"HTTP {code}"
-                            retry_after = _retry_after(response)
-                        else:
-                            if existing and code == 200:
-                                existing = 0
-                            written = existing
-                            with part.open("ab" if existing else "wb") as fh:
-                                for block in response.iter_content(chunk_size=256 * 1024):
-                                    if not block:
-                                        continue
-                                    if self.rate_limiter:
-                                        self.rate_limiter.consume(len(block))
-                                    fh.write(block)
-                                    written += len(block)
-                                    with self._status_lock:
-                                        record.update({"status": "downloading", "bytes": written})
-                                    if progress:
-                                        progress(item, written, expected)
-                                    self._save_status_throttled()
-                            if part.stat().st_size == expected:
-                                complete = True
-                                break
-                            last_error = f"size {part.stat().st_size}, expected {expected}"
+                with (
+                    self._conn_semaphore,
+                    _tracked(self._monitor),
+                    self._session_pool().acquire() as session,
+                    session.get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                    ) as response,
+                ):
+                    code = response.status_code
+                    if code in AUTH_EXPIRED_CODES:
+                        last_error = f"HTTP {code} (download link expired?)"
+                        url = urls.refresh(url)
+                    elif code not in (200, 206):
+                        last_error = f"HTTP {code}"
+                        retry_after = _retry_after(response)
+                    else:
+                        if existing and code == 200:
+                            existing = 0
+                        written = existing
+                        with part.open("ab" if existing else "wb") as fh:
+                            for block in response.iter_content(chunk_size=READ_BLOCK_SIZE):
+                                if not block:
+                                    continue
+                                if self.rate_limiter:
+                                    self.rate_limiter.consume(len(block))
+                                fh.write(block)
+                                written += len(block)
+                                self._monitor.add_bytes(len(block))
+                                with self._status_lock:
+                                    record.update({"status": "downloading", "bytes": written})
+                                if progress:
+                                    progress(item, written, expected)
+                                self._save_status_throttled()
+                        if part.stat().st_size == expected:
+                            complete = True
+                            break
+                        last_error = f"size {part.stat().st_size}, expected {expected}"
             except (requests.RequestException, QuarkApiError) as exc:
                 last_error = str(exc)
             if attempt < self.retries:
@@ -440,6 +517,7 @@ class ResumableDownloader:
                     self._conn_semaphore,
                     self.rate_limiter,
                     self.retries,
+                    self._monitor,
                 ): (idx, start, end)
                 for idx, start, end in pending
             }
@@ -551,49 +629,83 @@ def _download_chunk_inplace(
     conn_semaphore: threading.BoundedSemaphore,
     rate_limiter: RateLimiter | None = None,
     retries: int = DEFAULT_RETRIES,
+    monitor: _TransferMonitor | None = None,
 ) -> int:
-    """Download a chunk into memory and write directly to part_path at offset `start`."""
+    """Download a chunk and write it into ``part_path`` at offset ``start``.
+
+    Bytes received before a failure are kept and the next attempt resumes from where the
+    connection died. Connections that are alive but crawling are dropped and re-established
+    (a few times per chunk) so one bad connection cannot hold a worker slot for minutes.
+    """
     expected = end - start + 1
-    headers = _cdn_headers()
-    headers["Range"] = f"bytes={start}-{end}"
     url = urls.current()
     last_error = "unknown"
+    buffer = bytearray()
+    failures = 0
+    slow_restarts = 0
 
-    for attempt in range(1, retries + 1):
+    while True:
         retry_after: float | None = None
+        slow = False
+        headers = _cdn_headers()
+        headers["Range"] = f"bytes={start + len(buffer)}-{end}"
+        # With a rate limit the limiter itself slows connections; don't mistake that for a bad one.
+        watch_speed = rate_limiter is None and slow_restarts < MAX_SLOW_RESTARTS
         try:
-            with conn_semaphore:
-                with pool.acquire() as session:
-                    with session.get(
-                        url, headers=headers, stream=True, timeout=(25, 180)
-                    ) as response:
-                        code = response.status_code
-                        if code == 206:
-                            buffer = bytearray()
-                            for block in response.iter_content(chunk_size=256 * 1024):
-                                if not block:
-                                    continue
-                                if rate_limiter:
-                                    rate_limiter.consume(len(block))
-                                buffer.extend(block)
+            with conn_semaphore, _tracked(monitor), pool.acquire() as session:
+                with session.get(
+                    url, headers=headers, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+                ) as response:
+                    code = response.status_code
+                    if code == 206:
+                        began = time.monotonic()
+                        got = 0
+                        for block in response.iter_content(chunk_size=READ_BLOCK_SIZE):
+                            if not block:
+                                continue
+                            if rate_limiter:
+                                rate_limiter.consume(len(block))
+                            buffer.extend(block)
+                            got += len(block)
+                            if monitor:
+                                monitor.add_bytes(len(block))
+                            if watch_speed and len(buffer) < expected:
+                                elapsed = time.monotonic() - began
+                                if (
+                                    elapsed >= SLOW_GRACE_SECONDS
+                                    and got / elapsed < MIN_CONNECTION_SPEED
+                                ):
+                                    slow = True
+                                    break
+                        if not slow:
                             if len(buffer) == expected:
-                                with write_lock:
-                                    with part_path.open("r+b") as fh:
-                                        fh.seek(start)
-                                        fh.write(buffer)
+                                with write_lock, part_path.open("r+b") as fh:
+                                    fh.seek(start)
+                                    fh.write(buffer)
                                 return expected
                             last_error = f"chunk size {len(buffer)}, expected {expected}"
-                        elif code in AUTH_EXPIRED_CODES:
-                            last_error = f"HTTP {code} (download link expired?)"
-                            url = urls.refresh(url)
-                        else:
-                            last_error = f"HTTP {code}"
-                            retry_after = _retry_after(response)
+                            if len(buffer) > expected:
+                                buffer.clear()
+                    elif code in AUTH_EXPIRED_CODES:
+                        last_error = f"HTTP {code} (download link expired?)"
+                        url = urls.refresh(url)
+                    else:
+                        last_error = f"HTTP {code}"
+                        retry_after = _retry_after(response)
         except (requests.RequestException, QuarkApiError) as exc:
             last_error = str(exc)
-        if attempt < retries:
-            _sleep_backoff(attempt, retry_after)
-    raise DownloadError(f"chunk failed for {display_path} bytes={start}-{end}: {last_error}")
+
+        if slow:
+            slow_restarts += 1
+            if monitor:
+                monitor.note_slow_restart()
+            continue  # reconnect right away; partial data is kept
+        failures += 1
+        if failures >= retries:
+            raise DownloadError(
+                f"chunk failed for {display_path} bytes={start}-{end}: {last_error}"
+            )
+        _sleep_backoff(failures, retry_after)
 
 
 # Kept for backward compatibility with existing tests

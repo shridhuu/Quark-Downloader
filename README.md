@@ -343,11 +343,36 @@ Transferred 1.9 GiB in 3m41s (avg 8.8 MiB/s)
 | PowerShell blocks `Activate.ps1` | Run `Set-ExecutionPolicy -Scope Process Bypass` |
 | Chromium missing | Run `python -m playwright install chromium` |
 | `Timed out waiting for Quark QR login` | Use `--login-timeout 600` |
-| Speed is slow | Try `--workers 16` or `--parallel-files 2` (excessive connections can be throttled by CDN) |
+| Speed is slow or jumps up and down | See the **Speed tips** section below |
 | `HTTP 403` / link expired | Handled automatically with fresh link minting |
 | Cloud cleanup failed | Delete `quarkdl-<id>-<time>` folder manually in Quark web/app |
 | `--include` matches nothing | Start patterns with `**/` and check paths with `quarkdl list` |
 | Download was interrupted | Re-run the exact same command — it reuses the cloud folder and resumes chunks |
+
+---
+
+## 🏎️ Speed tips
+
+The progress line shows the live speed and how many connections are open:
+
+```text
+   42.3% 310.5 MiB/700.0 MiB  3.2 MiB/s | all  61.0% ETA 4m12s | conn 32/32 | path/to/file.mkv
+```
+
+Use the `conn` number to see where the limit is:
+
+| What you see | What it usually means | What to try |
+|---|---|---|
+| `conn 32/32` all the time, but the speed is low | Quark/CDN is limiting each connection (or your account). More work from this tool will not help | Raise `--workers` (e.g. `64`) and see if the total goes up |
+| `conn` well below the maximum | Connections are being dropped, retried or waiting | Check for `slow restarts` and failures; lower `--workers` if the CDN is rejecting connections |
+| `(slow restarts N)` keeps growing | Individual connections are crawling and are being replaced | Normal in small numbers; if it never stops, try fewer `--workers` |
+
+Notes:
+
+* Speed is measured on bytes as they arrive, over a rolling 10-second window, so brief dips and bursts are smoothed out. Real swings still show up.
+* A connection that delivers almost nothing is dropped after about 5 seconds and re-opened, keeping the bytes it already received. A connection that stalls completely times out after 20 seconds.
+* Another program downloading at the same time (a browser, for example) shares your bandwidth, and Quark may serve a different file at a different speed than the one you are comparing against.
+* `--limit-rate` turns the slow-connection check off, because the limiter itself slows connections down.
 
 ---
 

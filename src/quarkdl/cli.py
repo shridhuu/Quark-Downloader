@@ -251,6 +251,7 @@ def _execute_download(
             return 0
 
         rate_limit_bps = parse_rate_limit(args.limit_rate) if args.limit_rate else None
+        reporter = ProgressReporter(total_bytes=total_size)
         downloader = ResumableDownloader(
             api,
             args.output,
@@ -260,8 +261,16 @@ def _execute_download(
             parallel_files=args.parallel_files,
             retries=args.retries,
             rate_limit=rate_limit_bps,
+            on_bytes=reporter.record_bytes,
         )
-        reporter = ProgressReporter(total_bytes=total_size)
+
+        def _connection_status() -> str:
+            text = f"conn {downloader.active_connections}/{args.workers}"
+            if downloader.slow_restarts:
+                text += f" (slow restarts {downloader.slow_restarts})"
+            return text
+
+        reporter.set_extra(_connection_status)
         try:
             failures = downloader.download_many(files, progress=reporter)
         finally:

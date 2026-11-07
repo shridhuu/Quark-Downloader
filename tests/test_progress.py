@@ -75,3 +75,32 @@ def test_reporter_throttles_output():
     clock.now += 2
     reporter(item, 40, 100)
     assert len(lines) == 2
+
+
+def test_reporter_uses_per_block_bytes_for_speed_once_available():
+    clock = FakeClock()
+    lines: list[str] = []
+    reporter = ProgressReporter(total_bytes=4000, interval=0, clock=clock, emit=lines.append)
+    item = DownloadItem(fid="f", path="a.bin", size=4000)
+
+    reporter(item, 0, 4000)  # baseline
+    for _ in range(4):  # 1000 B/s arriving steadily, but the chunk only completes at the end
+        clock.now += 1
+        reporter.record_bytes(1000)
+    reporter(item, 4000, 4000)
+
+    assert reporter._meter.total == 4000  # chunk-completion delta was not double counted
+    assert "1000 B/s" in lines[-1]
+
+
+def test_reporter_appends_extra_status():
+    clock = FakeClock()
+    lines: list[str] = []
+    reporter = ProgressReporter(interval=0, clock=clock, emit=lines.append)
+    reporter.set_extra(lambda: "conn 7/32")
+    item = DownloadItem(fid="f", path="a.bin", size=100)
+    reporter(item, 0, 100)
+    clock.now += 1
+    reporter(item, 100, 100)
+
+    assert "| conn 7/32 |" in lines[-1]
