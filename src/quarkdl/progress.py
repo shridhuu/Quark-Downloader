@@ -83,7 +83,11 @@ class ProgressReporter:
         self._emit = emit
         self._meter = RateMeter(window, clock)
         self._seen: dict[str, int] = {}
+        self._totals: dict[str, int] = {}
+        self._items: dict[str, DownloadItem] = {}
+        self._active_key: str | None = None
         self._overall_done = 0
+        self._uncommitted = 0
         self._last_emit = float("-inf")
         self._lock = threading.Lock()
         self._wire_mode = False
@@ -97,31 +101,73 @@ class ProgressReporter:
         """Feed bytes as they arrive off the network.
 
         Once used, speed comes from these per-block samples instead of per-chunk completions,
-        which arrive in bursts and made the displayed speed jump up and down.
+        and progress lines continue ticking every ``interval`` even while large or heavily
+        throttled chunks are still in flight.
         """
+        if nbytes <= 0:
+            return
         with self._lock:
             self._wire_mode = True
             self._meter.add(nbytes)
+            self._uncommitted += nbytes
+            now = self._clock()
+            if self._active_key is None or now - self._last_emit < self._interval:
+                return
+            key = self._active_key
+            item = self._items.get(key)
+            base_done = self._seen.get(key, 0)
+            total = self._totals.get(key, 0)
+            if item is None or (total > 0 and base_done >= total):
+                return
+            live_done = self._live_item_done(base_done, total)
+            msg = self._format(item, live_done, total)
+            self._last_emit = now
+            self._emit(msg)
 
     def __call__(self, item: DownloadItem, done: int, total: int) -> None:
         key = item.fid or item.path
         with self._lock:
             previous = self._seen.get(key)
             self._seen[key] = done
+            self._totals[key] = total
+            self._items[key] = item
             if previous is None:
                 self._overall_done += done
+                if total > 0 and done < total:
+                    self._active_key = key
                 return
-            delta = done - previous
+            delta = max(0, done - previous)
             self._overall_done += delta
-            if not self._wire_mode:
+            if self._wire_mode:
+                self._uncommitted = max(0, self._uncommitted - delta)
+            else:
                 self._meter.add(delta)
 
             now = self._clock()
-            finished = total > 0 and done >= total
+            finished = total == 0 or done >= total
+            if finished:
+                incomplete = [k for k, d in self._seen.items() if d < self._totals.get(k, 0)]
+                if incomplete:
+                    self._active_key = incomplete[0]
+                else:
+                    self._active_key = None
+                    self._uncommitted = 0
+            else:
+                self._active_key = key
+
             if finished or now - self._last_emit >= self._interval:
-                msg = self._format(item, done, total)
+                live_done = done if finished else self._live_item_done(done, total)
+                msg = self._format(item, live_done, total)
                 self._last_emit = now
                 self._emit(msg)
+
+    def _live_item_done(self, committed: int, total: int) -> int:
+        if not self._wire_mode or total <= 0 or committed >= total:
+            return committed
+        incomplete_count = sum(1 for k, d in self._seen.items() if d < self._totals.get(k, 0))
+        if incomplete_count != 1:
+            return committed
+        return min(max(total - 1, committed), committed + self._uncommitted)
 
     def _format(self, item: DownloadItem, done: int, total: int) -> str:
         pct = 100 * done / total if total else 100.0
@@ -129,8 +175,15 @@ class ProgressReporter:
         line = f"  {pct:5.1f}% {human_bytes(done)}/{human_bytes(total)}"
         line += f"  {human_bytes(int(speed))}/s" if speed > 0 else "  --/s"
         if self._total_bytes:
-            remaining = max(self._total_bytes - self._overall_done, 0)
-            overall_pct = min(100 * self._overall_done / self._total_bytes, 100.0)
+            if self._wire_mode and self._overall_done < self._total_bytes:
+                live_overall = min(
+                    max(self._total_bytes - 1, self._overall_done),
+                    self._overall_done + self._uncommitted,
+                )
+            else:
+                live_overall = self._overall_done
+            remaining = max(self._total_bytes - live_overall, 0)
+            overall_pct = min(100 * live_overall / self._total_bytes, 100.0)
             eta = format_duration(remaining / speed) if speed > 0 else "--"
             line += f" | all {overall_pct:5.1f}% ETA {eta}"
         if self._extra is not None:

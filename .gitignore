@@ -17,9 +17,11 @@ build/
 cookies.txt
 storage_state*.json
 *.part
+*.meta
 *.assembling
 *.size_mismatch_*
 *.chunks/
 *.log
 .quarkdl-status.json
 downloads/
+downloadss/

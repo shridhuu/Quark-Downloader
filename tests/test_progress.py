@@ -104,3 +104,24 @@ def test_reporter_appends_extra_status():
     reporter(item, 100, 100)
 
     assert "| conn 7/32 |" in lines[-1]
+
+
+def test_reporter_emits_live_wire_progress_before_first_chunk_completes():
+    clock = FakeClock()
+    lines: list[str] = []
+    reporter = ProgressReporter(total_bytes=10_000, interval=1.0, clock=clock, emit=lines.append)
+    item = DownloadItem(fid="f", path="movie.mkv", size=10_000)
+
+    reporter(item, 0, 10_000)  # baseline before ranged workers start
+    assert lines == []
+
+    clock.now += 1.0
+    reporter.record_bytes(2500)  # 25% received across open sockets, 0 chunks finished yet
+    assert len(lines) == 1
+    assert "25.0%" in lines[-1]
+    assert "all  25.0%" in lines[-1]
+
+    clock.now += 1.0
+    reporter(item, 10_000, 10_000)  # chunk finishes; no double counting
+    assert "100.0%" in lines[-1]
+    assert reporter._meter.total == 2500

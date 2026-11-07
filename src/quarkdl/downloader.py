@@ -11,12 +11,14 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import BinaryIO
 
 import requests
 from requests.adapters import HTTPAdapter
 
 from .api import PC_UA, QuarkApi, QuarkApiError
 from .core import DownloadItem, plan_ranges, sanitize_rel_path
+from .progress import RateMeter
 
 ProgressCallback = Callable[[DownloadItem, int, int], None]
 
@@ -29,12 +31,15 @@ MAX_RETRY_AFTER = 60.0
 # be 180, which let one stalled connection hold a worker slot for three minutes).
 CONNECT_TIMEOUT = 15.0
 READ_TIMEOUT = 20.0
-# A connection that is alive but crawling (below MIN_CONNECTION_SPEED bytes/s once
-# SLOW_GRACE_SECONDS have passed) is dropped and re-opened, keeping the bytes it already got.
-# After MAX_SLOW_RESTARTS restarts a chunk is allowed to finish at whatever speed it gets, so a
-# uniformly throttled CDN cannot make every connection restart forever.
+# A connection that is alive but crawling is dropped and re-opened, keeping the bytes it already
+# got. "Crawling" is judged against the other connections: after SLOW_GRACE_SECONDS it must be
+# below SLOW_FLEET_FRACTION of the average speed per open connection, and below
+# MIN_CONNECTION_SPEED bytes/s. If the CDN throttles every connection equally nothing is
+# "slow" relative to the rest, so nothing gets restarted pointlessly. After MAX_SLOW_RESTARTS
+# restarts a chunk is allowed to finish at whatever speed it gets.
 SLOW_GRACE_SECONDS = 5.0
 MIN_CONNECTION_SPEED = 16 * 1024
+SLOW_FLEET_FRACTION = 0.2
 MAX_SLOW_RESTARTS = 3
 # iter_content() only yields once this many bytes have arrived, so this is also the granularity
 # of speed accounting and slow-connection detection. Small keeps both responsive.
@@ -80,15 +85,44 @@ class _TransferMonitor:
     per finished chunk (chunks finish in bursts, which made the displayed speed jump around).
     """
 
-    def __init__(self, on_bytes: Callable[[int], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_bytes: Callable[[int], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._on_bytes = on_bytes
         self._lock = threading.Lock()
+        self._meter = RateMeter(clock=clock)
+        self._last_peer_speed: float | None = None
         self.active = 0
         self.slow_restarts = 0
 
     def add_bytes(self, nbytes: int) -> None:
+        with self._lock:
+            self._meter.add(nbytes)
         if self._on_bytes is not None:
             self._on_bytes(nbytes)
+
+    def slow_floor(self, own_speed: float = 0.0) -> float:
+        """Speed (bytes/s) below which a connection counts as crawling right now.
+
+        With multiple open connections, compares against the average speed of the *other*
+        connections so an account/CDN cap that throttles every worker equally never triggers
+        pointless restarts (including on the final tail chunk after peers finish). With only a
+        single connection ever observed, falls back to ``MIN_CONNECTION_SPEED``.
+        """
+        with self._lock:
+            active = self.active
+            total_speed = self._meter.speed()
+            if active >= 2:
+                peer_speed = max(0.0, total_speed - own_speed) / (active - 1)
+                if peer_speed > 0:
+                    self._last_peer_speed = peer_speed
+            else:
+                peer_speed = self._last_peer_speed
+        if peer_speed is None:
+            return float(MIN_CONNECTION_SPEED)
+        return min(float(MIN_CONNECTION_SPEED), SLOW_FLEET_FRACTION * peer_speed)
 
     def note_slow_restart(self) -> None:
         with self._lock:
@@ -126,7 +160,9 @@ class _SessionPool:
     def _new(self) -> requests.Session:
         session = requests.Session()
         session.cookies.update(self._source.cookies)
-        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0)
+        # Keep pools for several hosts so 302 redirects between Quark's download gateway and
+        # regional CDN edges stay warm instead of evicting each other's TLS connections.
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=4, max_retries=0)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         with self._lock:
@@ -501,52 +537,58 @@ class ResumableDownloader:
                     _save_meta(meta, expected, self.chunk_size, completed_indices)
                     last_meta_save[0] = time.monotonic()
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(self.workers, max(1, len(pending)))
-        ) as executor:
-            futures = {
-                executor.submit(
-                    _download_chunk_inplace,
-                    pool,
-                    urls,
-                    start,
-                    end,
-                    part,
-                    file_write_lock,
-                    item.path,
-                    self._conn_semaphore,
-                    self.rate_limiter,
-                    self.retries,
-                    self._monitor,
-                ): (idx, start, end)
-                for idx, start, end in pending
-            }
-            try:
-                for future in concurrent.futures.as_completed(futures):
-                    idx, start, end = futures[future]
-                    got = future.result()
-                    done_bytes += got
-                    completed_indices.add(idx)
-                    with self._status_lock:
-                        record.update(
-                            {
-                                "status": "downloading",
-                                "bytes": done_bytes,
-                                "chunks_done": len(completed_indices),
-                                "chunks_total": len(ranges),
-                            }
-                        )
-                    if progress:
-                        progress(item, done_bytes, expected)
-                    self._save_status_throttled()
-                    _save_meta_throttled()
-            except BaseException:
-                for future in futures:
-                    future.cancel()
-                with meta_save_lock:
-                    _save_meta(meta, expected, self.chunk_size, completed_indices)
-                self._save_status()
-                raise
+        try:
+            with (
+                part.open("r+b") as part_fh,
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(self.workers, max(1, len(pending)))
+                ) as executor,
+            ):
+                futures = {
+                    executor.submit(
+                        _download_chunk_inplace,
+                        pool,
+                        urls,
+                        start,
+                        end,
+                        part_fh,
+                        file_write_lock,
+                        item.path,
+                        self._conn_semaphore,
+                        self.rate_limiter,
+                        self.retries,
+                        self._monitor,
+                    ): (idx, start, end)
+                    for idx, start, end in pending
+                }
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, start, end = futures[future]
+                        got = future.result()
+                        done_bytes += got
+                        completed_indices.add(idx)
+                        with self._status_lock:
+                            record.update(
+                                {
+                                    "status": "downloading",
+                                    "bytes": done_bytes,
+                                    "chunks_done": len(completed_indices),
+                                    "chunks_total": len(ranges),
+                                }
+                            )
+                        if progress:
+                            progress(item, done_bytes, expected)
+                        self._save_status_throttled()
+                        _save_meta_throttled()
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
+        except BaseException:
+            with meta_save_lock:
+                _save_meta(meta, expected, self.chunk_size, completed_indices)
+            self._save_status()
+            raise
 
         if part.stat().st_size != expected or len(completed_indices) != len(ranges):
             raise DownloadError(
@@ -596,6 +638,7 @@ def _migrate_legacy_chunks(
 def _cdn_headers() -> dict[str, str]:
     return {
         "User-Agent": PC_UA,
+        "Accept-Encoding": "identity",
         "Origin": "https://pan.quark.cn",
         "Referer": "https://pan.quark.cn/",
     }
@@ -623,7 +666,7 @@ def _download_chunk_inplace(
     urls: _UrlProvider,
     start: int,
     end: int,
-    part_path: Path,
+    part_target: Path | BinaryIO,
     write_lock: threading.Lock,
     display_path: str,
     conn_semaphore: threading.BoundedSemaphore,
@@ -631,7 +674,7 @@ def _download_chunk_inplace(
     retries: int = DEFAULT_RETRIES,
     monitor: _TransferMonitor | None = None,
 ) -> int:
-    """Download a chunk and write it into ``part_path`` at offset ``start``.
+    """Download a chunk and write it into ``part_target`` at offset ``start``.
 
     Bytes received before a failure are kept and the next attempt resumes from where the
     connection died. Connections that are alive but crawling are dropped and re-established
@@ -671,17 +714,26 @@ def _download_chunk_inplace(
                                 monitor.add_bytes(len(block))
                             if watch_speed and len(buffer) < expected:
                                 elapsed = time.monotonic() - began
-                                if (
-                                    elapsed >= SLOW_GRACE_SECONDS
-                                    and got / elapsed < MIN_CONNECTION_SPEED
-                                ):
-                                    slow = True
-                                    break
+                                if elapsed >= SLOW_GRACE_SECONDS:
+                                    own_speed = got / elapsed
+                                    floor = (
+                                        monitor.slow_floor(own_speed)
+                                        if monitor
+                                        else float(MIN_CONNECTION_SPEED)
+                                    )
+                                    if own_speed < floor:
+                                        slow = True
+                                        break
                         if not slow:
                             if len(buffer) == expected:
-                                with write_lock, part_path.open("r+b") as fh:
-                                    fh.seek(start)
-                                    fh.write(buffer)
+                                if isinstance(part_target, Path):
+                                    with write_lock, part_target.open("r+b") as fh:
+                                        fh.seek(start)
+                                        fh.write(buffer)
+                                else:
+                                    with write_lock:
+                                        part_target.seek(start)
+                                        part_target.write(buffer)
                                 return expected
                             last_error = f"chunk size {len(buffer)}, expected {expected}"
                             if len(buffer) > expected:

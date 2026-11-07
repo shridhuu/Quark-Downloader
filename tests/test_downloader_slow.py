@@ -27,7 +27,7 @@ class _Handler(BaseHTTPRequestHandler):
             state["requests"] += 1
             count = state["requests"]
             state["ranges"].append(self.headers.get("Range"))
-        data = PAYLOAD
+        data = state.get("payload", PAYLOAD)
         start_s, _, end_s = self.headers["Range"].removeprefix("bytes=").partition("-")
         start = int(start_s)
         end = int(end_s) if end_s else len(data) - 1
@@ -37,10 +37,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
         self.end_headers()
         if count <= state["trickle_first"]:
-            for i in range(0, len(body), 1024):  # ~50 KB/s
+            for i in range(0, len(body), 1024):  # ~33-50 KB/s
                 self.wfile.write(body[i : i + 1024])
                 self.wfile.flush()
                 threading.Event().wait(0.02)
+        elif state.get("fast_block_delay"):
+            delay = state["fast_block_delay"]
+            for i in range(0, len(body), 16 * 1024):  # ~500-800 KB/s
+                self.wfile.write(body[i : i + 16 * 1024])
+                self.wfile.flush()
+                threading.Event().wait(delay)
         else:
             self.wfile.write(body)
 
@@ -128,4 +134,34 @@ def test_wire_bytes_and_connection_count_are_reported(server, tmp_path):
     assert dest.read_bytes() == PAYLOAD
     assert sum(received) == len(PAYLOAD)
     assert len(received) > 1  # reported block by block, not once per chunk
+
+
+def test_uniformly_throttled_fleet_does_not_churn_connections(server, tmp_path):
+    big_payload = PAYLOAD * 4
+    server.state["payload"] = big_payload
+    server.state["trickle_first"] = 10_000  # every connection is throttled equally (~35-50 KB/s)
+    item = DownloadItem(fid="f.bin", path="root/f.bin", size=len(big_payload), name="f.bin")
+
+    with _downloader(server, tmp_path, workers=4, chunk_size=len(PAYLOAD)) as downloader:
+        dest = downloader.download_one(item)
+        slow_restarts = downloader.slow_restarts
+
+    assert dest.read_bytes() == big_payload
+    assert slow_restarts == 0
+
+
+def test_single_straggler_among_fast_peers_is_restarted(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(dl, "MIN_CONNECTION_SPEED", 200_000)
+    big_payload = PAYLOAD * 8
+    server.state["payload"] = big_payload
+    server.state["trickle_first"] = 1  # only the first connection crawls; peer worker streams fast
+    server.state["fast_block_delay"] = 0.02
+    item = DownloadItem(fid="f.bin", path="root/f.bin", size=len(big_payload), name="f.bin")
+
+    with _downloader(server, tmp_path, workers=2, chunk_size=len(PAYLOAD)) as downloader:
+        dest = downloader.download_one(item)
+        slow_restarts = downloader.slow_restarts
+
+    assert dest.read_bytes() == big_payload
+    assert slow_restarts == 1
 
